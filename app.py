@@ -148,6 +148,39 @@ with tab_data:
         "Logic": f["logic"],
     } for k, f in FACTORS.items()]), hide_index=True, width="stretch")
 
+    st.subheader("Pearson correlation with gold")
+    st.caption("r = cov(gold, factor) / (std(gold) x std(factor)). Close to +1: moves with gold. Close to -1: moves against gold. "
+               "Close to 0: no linear link. It is measured over the Test period in the sidebar, on the same lagged inputs the backtest uses.")
+    ca, cb = st.columns(2)
+    basis = ca.radio("Measured on", ["change", "level"], horizontal=True,
+                     format_func=lambda v: "Changes (recommended)" if v == "change" else "Price levels",
+                     help="Levels of two trending series often look correlated by accident. Changes are the honest test.")
+    horizon = cb.selectbox("Change horizon (days)", [1, 5, 21], disabled=basis == "level")
+    corr = features.correlation_table(gold, raw, params, start, end, basis, horizon)
+    if corr.empty:
+        st.info("No factor data loaded to correlate.")
+    else:
+        corr["Direction"] = np.where(corr["r"] >= 0, 1, -1)
+        corr_view = pd.DataFrame({
+            "Factor": [FACTORS[k]["label"] for k in corr["key"]],
+            "Pearson r": corr["r"].round(3),
+            "Strength": [features.strength(r) for r in corr["r"]],
+            "Observed relation": ["Same way as gold" if r > 0 else "Opposite to gold" for r in corr["r"]],
+            "Suggested direction": corr["Direction"],
+            "Current direction": [params[f"dir_{k}"] for k in corr["key"]],
+            "Agrees?": ["Yes" if params[f"dir_{k}"] == d else "No" for k, d in zip(corr["key"], corr["Direction"])],
+            "Days used": corr["n"],
+        })
+        st.dataframe(corr_view, hide_index=True, width="stretch")
+        order = corr.sort_values("r")
+        fig = go.Figure(go.Bar(x=order["r"], y=[FACTORS[k]["label"] for k in order["key"]], orientation="h",
+                               marker_color=[AQUA if r > 0 else RED for r in order["r"]],
+                               text=order["r"].round(2), hovertemplate="%{y}: r = %{x:.3f}<extra></extra>"))
+        chart(fig, 300, xaxis_title="Pearson r with gold", xaxis_range=[-1, 1], showlegend=False, hovermode="closest")
+        st.button("Set factor directions from correlation sign",
+                  on_click=load_into_sidebar, args=({f"dir_{k}": int(d) for k, d in zip(corr["key"], corr["Direction"])},),
+                  help="Copies the sign of r into the Factor direction settings (+1 if r > 0, -1 if r < 0).")
+
     st.subheader("Everything you can tweak")
     st.dataframe(pd.DataFrame([{
         "Group": s["group"], "Parameter": s["label"], "Current": str(params[k]), "Default": str(s["default"]),
@@ -256,7 +289,7 @@ with tab_bt:
 with tab_sweep:
     st.caption("Every run uses the sidebar settings as the base and changes only what you pick here. "
                "The best row of a sweep is fitted to the past; check it on a period it has not seen (Test period slider) before trusting it.")
-    mode = st.radio("What to vary", ["Chosen parameters (grid)", "Factor scores (random search)"], horizontal=True)
+    mode = st.radio("What to vary", ["Chosen parameters (grid)", "Many parameters (random search)", "Factor scores (random search)"], horizontal=True)
     sweepable = [k for k, s in PARAMS.items() if s["sweep"]]
     label_of = lambda k: f"{PARAMS[k]['group']}: {PARAMS[k]['label']}"
     progress = st.empty()
@@ -279,6 +312,28 @@ with tab_sweep:
         elif st.button("Run sweep", type="primary", disabled=n_runs == 0):
             bar = progress.progress(0.0)
             ss["sweep"] = engine.run_sweep(gold, raw, params, grid, progress=bar.progress, **run_kw)
+            ss["sweep_keys"] = chosen
+            progress.empty()
+    elif mode.startswith("Many"):
+        chosen = st.multiselect("Parameters to vary (any number)", sweepable, default=["atr_period", "sl_atr_mult", "entry_threshold", "tp_rr"], format_func=label_of)
+        ranges = {}
+        for k in chosen:
+            s = PARAMS[k]
+            cast = int if s["kind"] == "int" else float
+            a, b, c3 = st.columns(3)
+            lo = a.number_input(f"From: {s['label']}", cast(s["lo"]), cast(s["hi"]), cast(s["lo"]), step=cast(s["step"]), key=f"rs_lo_{k}")
+            hi = b.number_input("To", cast(s["lo"]), cast(s["hi"]), cast(s["hi"]), step=cast(s["step"]), key=f"rs_hi_{k}")
+            step = c3.number_input("Step", cast(s["step"]), cast(s["hi"]), cast(s["step"]), step=cast(s["step"]), key=f"rs_st_{k}")
+            ranges[k] = (lo, hi, step, s["kind"])
+        a, b = st.columns(2)
+        n_rand = a.number_input("Number of random runs", 10, MAX_RUNS, 500, step=50, key="rs_n")
+        seed = b.number_input("Random seed", 0, 9999, 0, key="rs_seed")
+        st.caption("Each run draws one value for every chosen parameter from its range, so the cost is the number of runs however many "
+                   "parameters you pick. Use the sensitivity charts below the results to find the few parameters that matter, "
+                   "then run a grid on those.")
+        if st.button("Run random search", type="primary", disabled=not ranges, key="rs_go"):
+            bar = progress.progress(0.0)
+            ss["sweep"] = engine.run_random_params(gold, raw, params, ranges, int(n_rand), int(seed), progress=bar.progress, **run_kw)
             ss["sweep_keys"] = chosen
             progress.empty()
     else:
@@ -321,6 +376,20 @@ with tab_sweep:
                                        hovertemplate="%{text}<br>CAGR %{y:.2f}%<br>Max DD %{x:.1f}%<extra></extra>"))
             chart(fig, 420, xaxis_title="Max drawdown % (closer to 0 is better)", yaxis_title="CAGR % (net of charges)", hovermode="closest",
                   showlegend=False, title="Each dot is one run")
+
+        if len(keys) > 3:
+            st.subheader("Sensitivity")
+            st.caption(f"Each dot is one run; the line is the average {rank_by} in 10 bins of that parameter. "
+                       "A flat line means the parameter barely matters. Fix those and grid the ones with a clear slope or peak.")
+            cols = st.columns(2)
+            for i, k in enumerate(keys):
+                d = sw[[k, rank_by]].dropna()
+                fig = go.Figure(go.Scatter(x=d[k], y=d[rank_by], mode="markers", marker=dict(size=5, color=BLUE, opacity=0.35), name="runs"))
+                if d[k].nunique() > 1:
+                    binned = d.groupby(pd.cut(d[k], 10, duplicates="drop"), observed=True).agg(x=(k, "mean"), y=(rank_by, "mean"))
+                    fig.add_trace(go.Scatter(x=binned["x"], y=binned["y"], mode="lines+markers", line=dict(color=RED, width=2), name="bin average"))
+                with cols[i % 2]:
+                    chart(fig, 260, xaxis_title=PARAMS[k]["label"], yaxis_title=rank_by, showlegend=False, hovermode="closest")
 
         st.dataframe(ranked.round(2), width="stretch", height=420,
                      column_config={k: st.column_config.NumberColumn(PARAMS[k]["label"]) for k in keys})

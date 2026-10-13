@@ -224,6 +224,22 @@ def run_random_weights(gold, raw, base_params, weight_keys, n, seed=0, **kw):
                      kw.get("start"), kw.get("end"), kw.get("rf", 0.04), kw.get("progress"))
 
 
+def run_random_params(gold, raw, base_params, ranges, n, seed=0, **kw):
+    """Try n random combinations of any number of parameters.
+    `ranges` is {param: (lo, hi, step, kind)}; each value is drawn from lo, lo+step, ... up to hi."""
+    rng = np.random.default_rng(seed)
+    pools = {}
+    for k, (lo, hi, step, kind) in ranges.items():
+        vals = np.arange(lo, hi + step / 2, step)
+        pools[k] = [int(round(v)) if kind == "int" else float(round(v, 6)) for v in vals]
+    sets = [{k: pool[rng.integers(len(pool))] for k, pool in pools.items()} for _ in range(n)]
+    w_keys = [k for k in pools if k.startswith("w_")]
+    if len(w_keys) == len(pools):  # an all-zero score set has no signal
+        sets = [s for s in sets if sum(s.values()) > 0]
+    return _run_many(gold, raw, base_params, sets, kw.get("costs"), kw.get("capital", 100_000),
+                     kw.get("start"), kw.get("end"), kw.get("rf", 0.04), kw.get("progress"))
+
+
 def _run_many(gold, raw, base_params, overrides, costs, capital, start, end, rf, progress):
     rows = []
     for j, ov in enumerate(overrides):

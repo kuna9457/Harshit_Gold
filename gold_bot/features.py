@@ -77,6 +77,49 @@ def factor_inputs(raw, index, p):
     return out
 
 
+RATE_LIKE = ("real_yield", "fed", "cpi")  # already in percent: use point changes, not % changes
+
+
+def pearson(x, y):
+    """Pearson r = cov(x, y) / (std(x) * std(y)) on the rows where both exist. Returns (r, n)."""
+    d = pd.concat([x, y], axis=1).dropna()
+    n = len(d)
+    if n < 3:
+        return np.nan, n
+    xd, yd = d.iloc[:, 0] - d.iloc[:, 0].mean(), d.iloc[:, 1] - d.iloc[:, 1].mean()
+    den = np.sqrt((xd ** 2).sum() * (yd ** 2).sum())
+    return (float((xd * yd).sum() / den) if den > 0 else np.nan), n
+
+
+def correlation_table(gold, raw, p, start=None, end=None, basis="change", horizon=1):
+    """Pearson correlation of every factor's input with gold's close.
+    basis 'level': price levels. basis 'change': `horizon`-day changes (avoids the spurious
+    correlation two trending series show on levels). Uses the same lagged inputs as the backtest."""
+    close = gold["Close"]
+    inputs = factor_inputs(raw, close.index, p)
+    rows = []
+    for key in FACTORS:
+        if key == "tech" or key not in inputs:
+            continue
+        x, g = inputs[key], close
+        if basis == "change":
+            x = x.diff(horizon) if key in RATE_LIKE else x.pct_change(horizon, fill_method=None)
+            g = close.pct_change(horizon)
+        x, g = x.replace([np.inf, -np.inf], np.nan), g
+        if start is not None:
+            x, g = x.loc[str(start):str(end)], g.loc[str(start):str(end)]
+        r, n = pearson(g, x)
+        rows.append(dict(key=key, r=r, n=n))
+    return pd.DataFrame(rows)
+
+
+def strength(r):
+    if pd.isna(r):
+        return "n/a"
+    a = abs(r)
+    return "Very strong" if a >= 0.8 else "Strong" if a >= 0.6 else "Moderate" if a >= 0.4 else "Weak" if a >= 0.2 else "Negligible"
+
+
 def build_features(gold, raw, p):
     """Returns the gold frame plus ATR, raw_<f>, z_<f>, sig_<f> for every factor and the final `score` (-1..+1)."""
     df = gold[["Open", "High", "Low", "Close", "Volume"]].copy()
