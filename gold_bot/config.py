@@ -122,7 +122,9 @@ def _p(group, label, kind, default, lo=None, hi=None, step=None, choices=None, s
 
 G_WEIGHT, G_DIR, G_FEAT, G_TECH, G_MACRO = "Factor scores (0-10)", "Factor direction", "Feature engineering", "ATR / Volume / Z-score", "Macro and flow inputs"
 G_SIGNAL, G_RISK, G_SIZE = "Entry and exit", "Risk management", "Position sizing"
-GROUP_ORDER = [G_WEIGHT, G_DIR, G_FEAT, G_TECH, G_MACRO, G_SIGNAL, G_RISK, G_SIZE]
+G_REGIME = "Regime filter (Phase 1, rule based)"
+G_HMM = "HMM gate (Phase 2b, needs a trained HMM)"
+GROUP_ORDER = [G_WEIGHT, G_DIR, G_FEAT, G_TECH, G_MACRO, G_SIGNAL, G_RISK, G_SIZE, G_REGIME, G_HMM]
 
 PARAMS = {}
 for _k, _f in FACTORS.items():
@@ -180,6 +182,49 @@ PARAMS.update({
                        help="Caps position notional. Risk sizing with a tight stop can ask for more than this."),
     "scale_by_score": _p(G_SIZE, "Smaller quantity on weaker score", "bool", False,
                          help="Scales quantity by |final score| / 0.5, capped at 1. Sheet 2: 'Buy (less Qty)'."),
+
+    # Phase 1: market type decides whether a trade is allowed and how big it is. Off = the original strategy.
+    "use_regime": _p(G_REGIME, "Use regime filter", "bool", False,
+                     help="On: every entry is checked against the market type (trend + volatility) first. "
+                          "Off: the original strategy, unchanged."),
+    "rg_trend_len": _p(G_REGIME, "Trend average (days)", "int", 200, 50, 300, 10,
+                       help="Uptrend = close above this moving average AND the average rising. Downtrend = the opposite. Anything else = mixed."),
+    "rg_slope_len": _p(G_REGIME, "Trend slope measured over (days)", "int", 20, 5, 60, 5),
+    "rg_vol_len": _p(G_REGIME, "Volatility window (days)", "int", 20, 10, 60, 5),
+    "rg_vol_lookback": _p(G_REGIME, "Volatility compared against (days)", "int", 756, 252, 1260, 63,
+                          help="Today's volatility is ranked against this much history (756 = about 3 years)."),
+    "rg_hivol_pct": _p(G_REGIME, "High volatility = above this percentile", "float", 0.80, 0.5, 0.95, 0.05),
+    "rg_mult_with": _p(G_REGIME, "Size when trading WITH the trend", "float", 1.0, 0.0, 1.0, 0.05,
+                       help="Multiplier on the quantity. Long in an uptrend, short in a downtrend."),
+    "rg_mult_mixed": _p(G_REGIME, "Size in a mixed / choppy market", "float", 0.5, 0.0, 1.0, 0.05,
+                        help="0 = no trades in mixed markets."),
+    "rg_mixed_min_score": _p(G_REGIME, "Mixed market: final score needed", "float", 0.40, 0.0, 0.9, 0.05,
+                             help="In a mixed market an entry needs at least this score (instead of the normal entry threshold)."),
+    "rg_block_against": _p(G_REGIME, "Block trades AGAINST the trend unless price confirms", "bool", True,
+                           help="Long in a downtrend (buying a bounce) is only allowed when the close is above the "
+                                "confirmation EMA and the recent low is higher than the one before. Shorts mirror this."),
+    "rg_mult_against": _p(G_REGIME, "Size when trading AGAINST the trend (confirmed)", "float", 0.25, 0.0, 1.0, 0.05),
+    "rg_confirm_ema": _p(G_REGIME, "Confirmation EMA (days)", "int", 20, 5, 60, 1),
+    "rg_mult_hivol": _p(G_REGIME, "Extra size multiplier in high volatility", "float", 0.5, 0.0, 1.0, 0.05,
+                        help="Applied on top of the trend multiplier when volatility is high. 0 = no trades in high volatility."),
+    "rg_tech_veto": _p(G_REGIME, "Price veto: technical factor must agree", "bool", False,
+                       help="Blocks a long when the ATR/Volume/Z-score signal is negative (and a short when it is positive), "
+                            "so macro factors alone cannot open a trade. In the default backtest these trades were not worse, so it is off."),
+
+    # Phase 2b: the HMM state (trained in the Regime lab tab) scales or blocks entries. Works with or without Phase 1.
+    "use_hmm_gate": _p(G_HMM, "Use HMM gate", "bool", False,
+                       help="On: entry size is also multiplied by the HMM state multiplier below. Needs 'Train HMM' in the "
+                            "Regime lab tab first. Before the HMM's first training period ends, the gate does nothing."),
+    "hmm_weighting": _p(G_HMM, "How the state is read", "choice", "probability", choices=["probability", "most_likely"],
+                        help="probability: multiplier = sum of (probability of each state x its multiplier), so it changes smoothly. "
+                             "most_likely: use only the most likely state's multiplier."),
+    "hmm_mult_calm": _p(G_HMM, "Size in the calmest state (S0)", "float", 1.0, 0.0, 1.0, 0.05),
+    "hmm_mult_mid": _p(G_HMM, "Size in the middle state(s)", "float", 1.0, 0.0, 1.0, 0.05,
+                       help="With 2 states there is no middle state."),
+    "hmm_mult_volatile": _p(G_HMM, "Size in the most volatile state", "float", 0.5, 0.0, 1.0, 0.05,
+                            help="0 = no new trades while the HMM says the market is in its most volatile state."),
+    "hmm_block_neg_er": _p(G_HMM, "Block longs when HMM expected return is below 0", "bool", False,
+                           help="Shorts are blocked when it is above 0."),
 })
 
 DEFAULT_PARAMS = {k: v["default"] for k, v in PARAMS.items()}

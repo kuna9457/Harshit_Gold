@@ -158,4 +158,76 @@ def build_features(gold, raw, p):
         num += w * s.fillna(0.0)
         den += w * s.notna()
     df["score"] = (num / den.where(den > 0)).where(df["sig_tech"].notna())
+    return add_regime(df, p)
+
+
+UP, DOWN, MIXED, UNKNOWN = "Uptrend", "Downtrend", "Mixed", "Not enough history"
+REGIME_ORDER = [UP, MIXED, DOWN, UNKNOWN]
+
+
+def add_regime(df, p):
+    """Phase 1 market type on each bar, using only data up to that bar's close.
+
+    trend:      +1 uptrend, -1 downtrend, 0 mixed (close vs a rising / falling moving average)
+    hivol:      today's volatility is in the top part of its own history
+    confirm_up: price has turned up (close above the EMA and a higher low); confirm_dn mirrors it
+    """
+    c = df["Close"]
+    ma = c.rolling(int(p["rg_trend_len"])).mean()
+    slope = ma - ma.shift(int(p["rg_slope_len"]))
+    up, dn = (c > ma) & (slope > 0), (c < ma) & (slope < 0)
+    known = ma.notna() & slope.notna()
+    df["rg_ma"] = ma
+    df["rg_trend"] = np.where(up, 1, np.where(dn, -1, 0)).astype(float)
+    df.loc[~known, "rg_trend"] = np.nan
+
+    vol = np.log(c).diff().rolling(int(p["rg_vol_len"])).std() * np.sqrt(252)
+    lb = int(p["rg_vol_lookback"])
+    df["rg_vol"] = vol
+    df["rg_vol_pct"] = vol.rolling(lb, min_periods=min(252, lb)).rank(pct=True)
+    df["rg_hivol"] = df["rg_vol_pct"] > p["rg_hivol_pct"]
+
+    ema = c.ewm(span=int(p["rg_confirm_ema"]), adjust=False).mean()
+    low5, low_prev5 = df["Low"].rolling(5).min(), df["Low"].shift(5).rolling(5).min()
+    high5, high_prev5 = df["High"].rolling(5).max(), df["High"].shift(5).rolling(5).max()
+    df["rg_confirm_up"] = (c > ema) & (low5 > low_prev5)
+    df["rg_confirm_dn"] = (c < ema) & (high5 < high_prev5)
+
+    t = df["rg_trend"]
+    df["regime"] = np.select([t == 1, t == -1, t == 0], [UP, DOWN, MIXED], UNKNOWN)
+    df["regime_label"] = df["regime"] + np.where(df["rg_hivol"] & (df["regime"] != UNKNOWN), " + high vol", "")
+    return df
+
+
+def regime_gate(row_trend, hivol, confirm, direction, score, p):
+    """Size multiplier (0 = trade blocked) for one entry in `direction` (+1 long, -1 short).
+    Kept as one small function so the backtest and the scorecard use exactly the same rule."""
+    if np.isnan(row_trend):
+        return 1.0
+    if row_trend == direction:
+        mult = p["rg_mult_with"]
+    elif row_trend == 0:
+        mult = p["rg_mult_mixed"] if abs(score) >= p["rg_mixed_min_score"] else 0.0
+    else:
+        mult = p["rg_mult_against"] if (confirm or not p["rg_block_against"]) else 0.0
+    if hivol:
+        mult *= p["rg_mult_hivol"]
+    return float(mult)
+
+
+def add_hmm(df, hmm, p):
+    """Phase 2b: put the trained HMM's state, expected return and size multiplier on the backtest calendar.
+    `hmm` is the output of regime_hmm.walk_forward (already out of sample, decided on each bar's close)."""
+    df = df.copy()
+    k = hmm["n_states"]
+    per_state = np.array([p["hmm_mult_calm"]] + [p["hmm_mult_mid"]] * (k - 2) + [p["hmm_mult_volatile"]], float)
+    probs = hmm["probs"].reindex(df.index)
+    state = hmm["state"].reindex(df.index)
+    if p["hmm_weighting"] == "most_likely":
+        mult = state.map(lambda s: per_state[int(s)] if pd.notna(s) else np.nan)
+    else:
+        mult = pd.Series(probs.to_numpy() @ per_state, index=df.index)
+    df["hmm_state"] = state.map(lambda s: hmm["names"][int(s)] if pd.notna(s) else "Not trained yet")
+    df["hmm_exp_ret"] = hmm["exp_ret"].reindex(df.index)
+    df["hmm_mult"] = mult
     return df

@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from gold_bot import data, engine, features
+from gold_bot import regime_hmm as hmm
 from gold_bot.config import (CATEGORY_ORDER, COST_FIELDS, COST_PRESETS, DATA_INPUTS, DEFAULT_COST_PRESET,
                              DEFAULT_PARAMS, FACTORS, GROUP_ORDER, PARAMS)
 
@@ -15,13 +16,24 @@ NET, GROSS, BH = "Strategy (net of charges)", "Strategy (gross)", "Buy and hold 
 CURVE_STYLE = {NET: dict(color=BLUE, width=2), GROSS: dict(color=ORANGE, width=2), BH: dict(color=GREY, width=2, dash="dot")}
 CHOICE_TEXT = {1: "+1  rising is bullish for gold", -1: "-1  rising is bearish for gold"}
 MAX_RUNS = 3000
+REGIME_COLOURS = {features.UP: AQUA, features.MIXED: ORANGE, features.DOWN: RED, features.UNKNOWN: GREY}
+STATE_COLOURS = [AQUA, BLUE, ORANGE, RED]
+# HMM only has no stop loss, so measures in R (multiples of the stop distance) do not apply to it.
+R_ROWS = ("Avg loss (R)", "Stop overruns (< -1.1R)", "R lost beyond the stop", "Worst trade (R)", "Sum of R")
+ORIG, RULES, HMM_ONLY = "Original strategy", "Strategy + rule filter (Phase 1)", "HMM only (Phase 2a)"
+HMM_GATE, COMBINED = "Strategy + HMM gate", "Strategy + rules + HMM (Phase 2b)"
 
 
 def chart(fig, height=340, **layout):
     layout.setdefault("hovermode", "x unified")
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=30, b=10),
                       legend=dict(orientation="h", y=1.12, x=0), **layout)
-    st.plotly_chart(fig, width="stretch")
+    # The same chart can appear in two tabs, so every chart gets its own key.
+    _chart_n[0] += 1
+    st.plotly_chart(fig, width="stretch", key=f"chart_{_chart_n[0]}")
+
+
+_chart_n = [0]
 
 
 @st.cache_data(show_spinner="Downloading market and macro data...")
@@ -54,6 +66,35 @@ def apply_preset():
 def load_into_sidebar(values):
     for k, v in values.items():
         ss[f"p_{k}"] = type(DEFAULT_PARAMS[k])(v)
+
+
+def regime_chart(f, title="Market type on each bar (Phase 1 rules)"):
+    """Gold price coloured by the rule-based market type, with high volatility days marked."""
+    fig = go.Figure(go.Scatter(x=f.index, y=f["Close"], name="Gold close", line=dict(color=GREY, width=1), showlegend=False))
+    for name, colour in REGIME_COLOURS.items():
+        d = f[f["regime"] == name]
+        if len(d):
+            fig.add_scatter(x=d.index, y=d["Close"], mode="markers", name=name, marker=dict(size=3, color=colour))
+    hv = f[f["rg_hivol"]]
+    if len(hv):
+        fig.add_scatter(x=hv.index, y=hv["Close"], mode="markers", name="High volatility",
+                        marker=dict(size=7, color="rgba(0,0,0,0)", line=dict(width=1, color=RED), symbol="circle-open"))
+    chart(fig, 380, yaxis_title="USD per oz", yaxis_type="log", title=title, hovermode="closest")
+
+
+def group_table(trades, key, label):
+    g = engine.by_group(trades, key)
+    if g.empty:
+        st.info("No trades.")
+    else:
+        st.dataframe(g.rename_axis(label).round(2), width="stretch")
+
+
+def compare_table(cols):
+    """cols = {column name: comparison_row dict}; shows the metrics as rows, one column per approach."""
+    t = pd.DataFrame(cols)
+    st.dataframe(t.apply(pd.to_numeric, errors="coerce").round(2), width="stretch", height=560)
+    return t
 
 
 def param_widget(name):
@@ -101,10 +142,10 @@ with st.sidebar:
 
 params = {k: ss[f"p_{k}"] for k in PARAMS}
 costs = {k: ss[f"c_{k}"] for k in COST_FIELDS}
-run_kw = dict(costs=costs, capital=capital, start=str(start), end=str(end), rf=rf)
+run_kw = dict(costs=costs, capital=capital, start=str(start), end=str(end), rf=rf, hmm=ss.get("hmm"))
 
 st.title("Gold (XAUUSD) macro strategy backtester")
-tab_data, tab_bt, tab_sweep = st.tabs(["Data and parameters", "Backtest", "Parameter sweep"])
+tab_data, tab_bt, tab_regime, tab_sweep = st.tabs(["Data and parameters", "Backtest", "Regime lab (rules vs HMM)", "Parameter sweep"])
 
 # ---------------------------------------------------------
 # Tab 1: what goes in, how often it changes, what can be tweaked
@@ -205,17 +246,19 @@ with tab_data:
 # Tab 2: single backtest
 # ---------------------------------------------------------
 with tab_bt:
+    if params["use_hmm_gate"] and ss.get("hmm") is None:
+        st.warning("'Use HMM gate' is on but no HMM is trained yet, so the gate does nothing. Train it in the Regime lab tab.")
     if st.button("Run backtest", type="primary"):
         try:
             ss["result"] = engine.run_backtest(gold, raw, params, **run_kw)
-            ss["result_inputs"] = (params, costs, capital, start, end, rf)
+            ss["result_inputs"] = (params, costs, capital, start, end, rf, id(ss.get("hmm")))
         except ValueError as e:
             st.error(str(e))
     res = ss.get("result")
     if res is None:
         st.info("Set the scores and parameters in the sidebar, then press Run backtest.")
     else:
-        if ss["result_inputs"] != (params, costs, capital, start, end, rf):
+        if ss["result_inputs"] != (params, costs, capital, start, end, rf, id(ss.get("hmm"))):
             st.warning("Settings have changed since this run. Press Run backtest to update.")
         m, x, f, curves, trades = res["metrics"], res["extra"], res["feat"], res["curves"], res["trades"]
         st.caption(f"Test period {f.index[0].date()} to {f.index[-1].date()}, {len(f):,} daily bars. "
@@ -244,6 +287,7 @@ with tab_bt:
         with right:
             st.markdown("**Trades**")
             order = ["Trades", "Winning", "Losing", "Breakeven", "Win rate %", "Profit factor", "Avg win", "Avg loss", "Avg R",
+                     "Avg loss (R)", "Stop overruns (< -1.1R)", "Longest losing streak",
                      "Avg bars held", "Time in market %", "Avg leverage when in", "Total charges", "Charges % of capital"]
             st.dataframe(pd.DataFrame({"Value": [f"{x[k]:,.2f}" if isinstance(x[k], float) else f"{x[k]:,}" for k in order]}, index=order),
                          width="stretch", height=280)
@@ -279,12 +323,247 @@ with tab_bt:
         fig = go.Figure([go.Bar(x=yearly.index, y=yearly[n], name=n, marker_color=col) for n, col in ((NET, BLUE), (BH, GREY))])
         chart(fig, 300, yaxis_title="Return %", barmode="group", title="Return by calendar year")
 
+        st.markdown("**Trades by market type** (on the signal bar)" + ("  |  regime filter ON" if res["params"]["use_regime"] else "  |  regime filter OFF"))
+        st.caption("Shows where the strategy makes and loses money. With the filter on, the size multiplier column in the trade log "
+                   "shows how much each trade was cut.")
+        group_table(trades, "regime", "Market type")
+        if "hmm_state" in trades and (trades["hmm_state"] != "").any():
+            st.markdown("**Trades by HMM state**")
+            group_table(trades, "hmm_state", "HMM state")
+        regime_chart(f)
+
         with st.expander(f"Trade log ({len(trades)} trades)"):
             st.dataframe(trades.round(2), hide_index=True, width="stretch")
             st.download_button("Download trade log (CSV)", trades.to_csv(index=False), "trades.csv", "text/csv")
 
 # ---------------------------------------------------------
-# Tab 3: vary parameters and scores
+# Tab 3: Regime lab. Phase 1 (rules) and Phase 2a (HMM alone), side by side
+# ---------------------------------------------------------
+with tab_regime:
+    st.caption("Phase 1 adds a rule-based market-type filter on top of the strategy. Phase 2a trains a Hidden Markov Model (HMM) "
+               "on gold's own price behaviour and tests it alone. Both use only data that was available at the time. "
+               "Plan: REGIME_PLAN.md in the project folder.")
+
+    # ---------- Phase 1 ----------
+    st.subheader("Phase 1: rule-based regime filter")
+    st.caption("Uses every sidebar setting, including the 'Regime filter' group. The original strategy is the same run with the filter off.")
+    if st.button("Run rule-based comparison", type="primary"):
+        try:
+            ss["lab_orig"] = engine.run_backtest(gold, raw, {**params, "use_regime": False, "use_hmm_gate": False}, **run_kw)
+            ss["lab_rules"] = engine.run_backtest(gold, raw, {**params, "use_regime": True, "use_hmm_gate": False}, **run_kw)
+            ss["lab_inputs"] = (params, costs, capital, start, end, rf)
+        except ValueError as e:
+            st.error(str(e))
+    lo, lr = ss.get("lab_orig"), ss.get("lab_rules")
+    if lo is None:
+        st.info("Press 'Run rule-based comparison'. Tune the filter in the sidebar under 'Regime filter (Phase 1, rule based)'.")
+    else:
+        if ss["lab_inputs"] != (params, costs, capital, start, end, rf):
+            st.warning("Settings have changed since this run. Press the button again to update.")
+        c = st.columns(5)
+        a, b = engine.comparison_row(lo), engine.comparison_row(lr)
+        c[0].metric("CAGR, with filter", f"{b['CAGR %']:.2f}%", f"{b['CAGR %'] - a['CAGR %']:+.2f}% vs original")
+        c[1].metric("Max drawdown, with filter", f"{b['Max drawdown %']:.1f}%", f"{b['Max drawdown %'] - a['Max drawdown %']:+.1f}% vs original")
+        c[2].metric("Losing trades", f"{b['Losing trades']}", f"{b['Losing trades'] - a['Losing trades']:+d}", delta_color="inverse")
+        c[3].metric("Longest losing streak", f"{b['Longest losing streak']}",
+                    f"{b['Longest losing streak'] - a['Longest losing streak']:+d}", delta_color="inverse")
+        c[4].metric("Profit factor", f"{b['Profit factor']:.2f}", f"{b['Profit factor'] - a['Profit factor']:+.2f}")
+        compare_table({ORIG: a, RULES: b})
+        curves = pd.DataFrame({ORIG: lo["curves"][NET], RULES: lr["curves"][NET], BH: lo["curves"][BH]})
+        fig = go.Figure([go.Scatter(x=curves.index, y=curves[n], name=n, line=sty) for n, sty in
+                         ((ORIG, dict(color=GREY, width=1.5)), (RULES, dict(color=BLUE, width=2)), (BH, dict(color=GREY, width=1, dash="dot")))])
+        chart(fig, 380, yaxis_type="log", yaxis_title="Account value (USD)", title="Account value: original vs with rule filter")
+        l, r = st.columns(2)
+        with l:
+            st.markdown("**Original strategy: trades by market type**")
+            group_table(lo["trades"], "regime", "Market type")
+        with r:
+            st.markdown("**With rule filter: trades by market type**")
+            group_table(lr["trades"], "regime", "Market type")
+        regime_chart(lo["feat"])
+        f = lo["feat"]
+        fig = go.Figure(go.Scatter(x=f.index, y=f["rg_vol_pct"] * 100, line=dict(color=BLUE, width=1), name="Volatility percentile"))
+        fig.add_hline(y=params["rg_hivol_pct"] * 100, line=dict(color=RED, dash="dash"), annotation_text="high volatility above")
+        chart(fig, 220, yaxis_title="Percentile", yaxis_range=[0, 100], showlegend=False, title="Today's volatility vs its own history")
+
+    st.divider()
+
+    # ---------- Phase 2a ----------
+    st.subheader("Phase 2a: HMM alone")
+    st.caption("The HMM groups days into hidden states from price behaviour only (no macro). It is refitted every N days on past "
+               "data, and each day's state comes from the forward filter (data up to that day only). States are sorted by "
+               "volatility, so S0 is always the calmest.")
+    a1, a2, a3 = st.columns(3)
+    h_keys = a1.multiselect("Model inputs", list(hmm.HMM_FEATURES), default=hmm.DEFAULT_FEATURES, format_func=hmm.HMM_FEATURES.get)
+    h_states = a2.selectbox("Number of states", [2, 3, 4], index=1)
+    h_rule = a3.selectbox("HMM-only trading rule", list(hmm.SIGNAL_RULES), format_func=hmm.SIGNAL_RULES.get)
+    b1, b2, b3, b4 = st.columns(4)
+    h_train = b1.number_input("First training period (years)", 2, 15, 5)
+    h_refit = b2.number_input("Refit every (trading days)", 21, 756, 252, step=21)
+    h_window = b3.selectbox("Training window", ["expanding", "rolling"],
+                            format_func=lambda v: "Expanding (all history so far)" if v == "expanding" else "Rolling (last N years only)")
+    h_init = b4.number_input("Random restarts per fit", 1, 10, 2, help="More restarts = less chance of a poor fit, slower training.")
+    h_short = st.checkbox("HMM only: go short instead of flat when the rule is off", value=False)
+    h_settings = dict(keys=tuple(h_keys), n_states=int(h_states), train_years=int(h_train), refit_days=int(h_refit),
+                      window=h_window, n_init=int(h_init))
+    if st.button("Train HMM", type="primary", disabled=not h_keys):
+        bar = st.progress(0.0, text="Training the HMM walk-forward...")
+        try:
+            ss["hmm"] = hmm.walk_forward(gold, list(h_keys), int(h_states), int(h_train), int(h_refit), h_window, n_init=int(h_init),
+                                         progress=lambda v: bar.progress(v, text=f"Training the HMM walk-forward... {v:.0%}"))
+            ss["hmm_settings"] = h_settings
+        except ValueError as e:
+            st.error(str(e))
+        bar.empty()
+
+    H = ss.get("hmm")
+    if H is None:
+        st.info("Pick the inputs and press 'Train HMM' (about 30 seconds with the defaults).")
+    else:
+        if ss["hmm_settings"] != h_settings:
+            st.warning("HMM settings have changed since training. Press 'Train HMM' to retrain. "
+                       "(The trading rule and the short option apply without retraining.)")
+        feat_all = features.build_features(gold, raw, params)
+        h_start = max(pd.Timestamp(start), H["state"].index[0])
+        h_end = pd.Timestamp(end)
+        if h_end <= h_start:
+            st.error("The test period ends before the HMM has finished its first training period.")
+        else:
+            period = (str(h_start.date()), str(h_end.date()))
+            st.caption(f"HMM states are out of sample from {H['state'].index[0].date()} (after the first "
+                       f"{ss['hmm_settings']['train_years']} years). Everything below is measured from {period[0]} to {period[1]}, "
+                       f"{len(H['fits'])} refits.")
+            try:
+                h_res = engine.run_switch(feat_all, hmm.signal(H, h_rule), costs, capital, *period, rf, h_short)
+            except ValueError as e:
+                h_res = None
+                st.error(str(e))
+
+            st.markdown("**What each state looked like (out of sample, the day after the state was read)**")
+            st.dataframe(hmm.state_summary(H, gold, h_start, h_end).round(2), hide_index=True, width="stretch")
+
+            P, stt = H["probs"].loc[h_start:h_end], H["state"].loc[h_start:h_end]
+            px = gold["Close"].reindex(stt.index)
+            fig = go.Figure(go.Scatter(x=px.index, y=px.values, line=dict(color=GREY, width=1), showlegend=False, name="Gold close"))
+            for k, nm in enumerate(H["names"]):
+                d = px[stt == k]
+                fig.add_scatter(x=d.index, y=d.values, mode="markers", name=nm, marker=dict(size=3, color=STATE_COLOURS[k % 4]))
+            chart(fig, 380, yaxis_type="log", yaxis_title="USD per oz", title="Gold price coloured by the most likely HMM state", hovermode="closest")
+            fig = go.Figure([go.Scatter(x=P.index, y=P[nm], name=nm, stackgroup="p", line=dict(width=0.5, color=STATE_COLOURS[k % 4]))
+                             for k, nm in enumerate(H["names"])])
+            chart(fig, 240, yaxis_title="Probability", yaxis_range=[0, 1], title="State probabilities (forward filter)")
+
+            if h_res is not None:
+                st.markdown(f"**HMM-only backtest:** {hmm.SIGNAL_RULES[h_rule].lower()}; fully invested (1x) while on, "
+                            "no stop or target, same charges as the strategy.")
+                hc = h_res["curves"]
+                fig = go.Figure([go.Scatter(x=hc.index, y=hc[NET], name=HMM_ONLY, line=dict(color=BLUE, width=2)),
+                                 go.Scatter(x=hc.index, y=hc[BH], name=BH, line=dict(color=GREY, width=1.5, dash="dot"))])
+                chart(fig, 320, yaxis_type="log", yaxis_title="Account value (USD)", title="HMM only vs buy and hold")
+
+            st.markdown("**Does the HMM separate the strategy's winners from its losers?** "
+                        "The original strategy's trades, grouped by the HMM state on the signal bar.")
+            try:
+                o_res = engine.run_backtest(gold, raw, {**params, "use_regime": False, "use_hmm_gate": False}, costs, capital, *period, rf)
+                ot = o_res["trades"].copy()
+                if not ot.empty:
+                    ot["hmm_state"] = hmm.label_at_entry(ot, stt.map(dict(enumerate(H["names"]))), o_res["feat"].index)
+                l, r = st.columns(2)
+                with l:
+                    st.caption("By HMM state")
+                    group_table(ot, "hmm_state", "HMM state")
+                with r:
+                    st.caption("By rule-based market type (same trades)")
+                    group_table(ot, "regime", "Market type")
+            except ValueError as e:
+                o_res = None
+                st.error(str(e))
+
+            with st.expander(f"Refit log ({len(H['fits'])} fits): what the model learned each time"):
+                st.dataframe(H["fits"], hide_index=True, width="stretch")
+
+            # ---------- Side by side ----------
+            st.divider()
+            st.subheader("Side by side: original vs rule filter vs HMM only")
+            st.caption(f"All on the same period, {period[0]} to {period[1]}, with the same charges.")
+            if o_res is not None and h_res is not None:
+                try:
+                    r_res = engine.run_backtest(gold, raw, {**params, "use_regime": True, "use_hmm_gate": False}, costs, capital, *period, rf)
+                    bh = o_res["metrics"][BH]
+                    bh_row = {"CAGR %": bh["CAGR %"], "Max drawdown %": bh["Max drawdown %"], "Sharpe": bh["Sharpe"],
+                              "Calmar": bh["Calmar"], "Volatility %": bh["Volatility %"], "Time in market %": 100.0}
+                    compare_table({ORIG: engine.comparison_row(o_res), RULES: engine.comparison_row(r_res),
+                                   HMM_ONLY: {k: (np.nan if k in R_ROWS else v) for k, v in engine.comparison_row(h_res).items()},
+                                   BH: bh_row})
+                    cv = pd.DataFrame({ORIG: o_res["curves"][NET], RULES: r_res["curves"][NET], HMM_ONLY: h_res["curves"][NET]})
+                    fig = go.Figure([go.Scatter(x=cv.index, y=cv[n], name=n, line=sty) for n, sty in
+                                     ((ORIG, dict(color=GREY, width=1.5)), (RULES, dict(color=BLUE, width=2)), (HMM_ONLY, dict(color=ORANGE, width=2)))])
+                    fig.add_scatter(x=o_res["curves"].index, y=o_res["curves"][BH], name=BH, line=dict(color=GREY, width=1, dash="dot"))
+                    chart(fig, 400, yaxis_type="log", yaxis_title="Account value (USD)", title="Account value, same period")
+                    dd = (cv / cv.cummax() - 1) * 100
+                    fig = go.Figure([go.Scatter(x=dd.index, y=dd[n], name=n, line=dict(color=col, width=1.5))
+                                     for n, col in ((ORIG, GREY), (RULES, BLUE), (HMM_ONLY, ORANGE))])
+                    chart(fig, 260, yaxis_title="Drawdown %", title="Drawdown from peak")
+                    st.caption("HMM only is a different kind of strategy (a fully invested on/off switch), so compare drawdown, Sharpe "
+                               "and Calmar more than trade counts. For Phase 2b the deciding table is the one above it: if the HMM "
+                               "state separates winning and losing trades better than the rule-based market type, it is worth combining.")
+                except ValueError as e:
+                    st.error(str(e))
+
+            # ---------- Phase 2b ----------
+            st.divider()
+            st.subheader("Phase 2b: strategy + rules + HMM combined")
+            st.caption("The same strategy run four ways. The HMM gate multiplies the entry size by the multiplier of the HMM state "
+                       "(sidebar group 'HMM gate (Phase 2b)'); the rule filter uses the 'Regime filter' group. The deciding numbers "
+                       "are drawdown, Calmar, profit factor and how they hold up in both halves of the period.")
+            variants = {ORIG: dict(use_regime=False, use_hmm_gate=False), RULES: dict(use_regime=True, use_hmm_gate=False),
+                        HMM_GATE: dict(use_regime=False, use_hmm_gate=True), COMBINED: dict(use_regime=True, use_hmm_gate=True)}
+            v_colours = {ORIG: GREY, RULES: BLUE, HMM_GATE: ORANGE, COMBINED: AQUA}
+            try:
+                v_res = {n: engine.run_backtest(gold, raw, {**params, **v}, costs, capital, *period, rf, hmm=H) for n, v in variants.items()}
+                compare_table({n: engine.comparison_row(r) for n, r in v_res.items()})
+                fig = go.Figure([go.Scatter(x=r["curves"].index, y=r["curves"][NET], name=n, line=dict(color=v_colours[n], width=2 if n == COMBINED else 1.5))
+                                 for n, r in v_res.items()])
+                chart(fig, 400, yaxis_type="log", yaxis_title="Account value (USD)", title="Account value: four ways")
+                dd = pd.DataFrame({n: r["curves"][NET] for n, r in v_res.items()})
+                dd = (dd / dd.cummax() - 1) * 100
+                fig = go.Figure([go.Scatter(x=dd.index, y=dd[n], name=n, line=dict(color=v_colours[n], width=1.5)) for n in dd])
+                chart(fig, 260, yaxis_title="Drawdown %", title="Drawdown from peak")
+
+                st.markdown("**Does it hold up? Same four runs on each half of the period**")
+                st.caption("A filter that only helps in one half is probably fitted to that half. Look for the same ranking in both.")
+                mid = H["state"].loc[h_start:h_end].index[len(H["state"].loc[h_start:h_end]) // 2]
+                halves = {f"1st half ({period[0]} to {mid.date()})": (period[0], str(mid.date())),
+                          f"2nd half ({mid.date()} to {period[1]})": (str(mid.date()), period[1])}
+                keep = ["CAGR %", "Max drawdown %", "Sharpe", "Calmar", "Profit factor", "Trades", "Longest losing streak"]
+                cols = st.columns(2)
+                for col, (label, (a_, b_)) in zip(cols, halves.items()):
+                    with col:
+                        st.caption(label)
+                        half = {n: engine.comparison_row(engine.run_backtest(gold, raw, {**params, **v}, costs, capital, a_, b_, rf, hmm=H))
+                                for n, v in variants.items()}
+                        st.dataframe(pd.DataFrame(half).loc[keep].round(2), width="stretch")
+
+                st.markdown("**Combined run: trades by HMM state and by market type**")
+                st.caption("size_mult in the trade log is the final multiplier (rules x HMM). Sizing does not remove trades, "
+                           "so the HMM gate alone leaves the trade count unchanged; it shrinks the money at risk.")
+                ct = v_res[COMBINED]["trades"]
+                l, r = st.columns(2)
+                with l:
+                    group_table(ct, "hmm_state", "HMM state")
+                with r:
+                    group_table(ct, "regime", "Market type")
+                with st.expander(f"Combined run trade log ({len(ct)} trades)"):
+                    st.dataframe(ct.round(2), hide_index=True, width="stretch")
+                    st.download_button("Download combined trade log (CSV)", ct.to_csv(index=False), "trades_combined.csv", "text/csv")
+                st.button("Use rules + HMM in the sidebar", on_click=load_into_sidebar, args=({"use_regime": True, "use_hmm_gate": True},),
+                          help="Turns both gates on, so the Backtest and Parameter sweep tabs use the combined setup.")
+            except ValueError as e:
+                st.error(str(e))
+
+
+# ---------------------------------------------------------
+# Tab 4: vary parameters and scores
 # ---------------------------------------------------------
 with tab_sweep:
     st.caption("Every run uses the sidebar settings as the base and changes only what you pick here. "
