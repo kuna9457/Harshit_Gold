@@ -4,10 +4,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from gold_bot import data, engine, features
+from gold_bot import binance, data, engine, features, live, mtf, ticks
 from gold_bot import regime_hmm as hmm
 from gold_bot.config import (CATEGORY_ORDER, COST_FIELDS, COST_PRESETS, DATA_INPUTS, DEFAULT_COST_PRESET,
-                             DEFAULT_PARAMS, FACTORS, GROUP_ORDER, PARAMS)
+                             DEFAULT_PARAMS, FACTORS, GROUP_ORDER, PARAMS, TIMEFRAMES)
 
 st.set_page_config(page_title="Gold macro backtester", layout="wide")
 
@@ -39,6 +39,11 @@ _chart_n = [0]
 @st.cache_data(show_spinner="Downloading market and macro data...")
 def load(refresh_id):
     return data.load_all(refresh=refresh_id > 0)
+
+
+@st.cache_data(show_spinner="Loading Binance 15m gold bars (the first download takes a few minutes)...", ttl=900)
+def load_bars(symbol, refresh_id):
+    return binance.klines(symbol)
 
 
 # ---------------------------------------------------------
@@ -131,7 +136,7 @@ with st.sidebar:
 
     st.header("Strategy parameters")
     for group in GROUP_ORDER:
-        with st.expander(group, expanded=group == GROUP_ORDER[0]):
+        with st.expander(group, expanded=group in GROUP_ORDER[:2]):
             for name, spec in PARAMS.items():
                 if spec["group"] == group:
                     param_widget(name)
@@ -145,7 +150,8 @@ costs = {k: ss[f"c_{k}"] for k in COST_FIELDS}
 run_kw = dict(costs=costs, capital=capital, start=str(start), end=str(end), rf=rf, hmm=ss.get("hmm"))
 
 st.title("Gold (XAUUSD) macro strategy backtester")
-tab_data, tab_bt, tab_regime, tab_sweep = st.tabs(["Data and parameters", "Backtest", "Regime lab (rules vs HMM)", "Parameter sweep"])
+tab_data, tab_bt, tab_regime, tab_sweep, tab_mtf, tab_live = st.tabs(
+    ["Data and parameters", "Backtest", "Regime lab (rules vs HMM)", "Parameter sweep", "Multi-timeframe (Binance)", "Live (paper)"])
 
 # ---------------------------------------------------------
 # Tab 1: what goes in, how often it changes, what can be tweaked
@@ -180,10 +186,11 @@ with tab_data:
     st.caption("You cannot change the data itself (the repo rate, CPI, the dollar). You can change how much each "
                "factor counts (score 0-10), which way it points, and the lookback it is measured over.")
     feat_now = features.build_features(gold, raw, params)
-    total_w = sum(params[f"w_{k}"] for k in FACTORS) or 1
+    total_w = sum(features.weight(params, k) for k in FACTORS) or 1
     st.dataframe(pd.DataFrame([{
-        "Factor": f["label"], "Data type": f["category"], "Score (0-10)": params[f"w_{k}"],
-        "Share of final score %": round(params[f"w_{k}"] / total_w * 100, 1),
+        "Factor": f["label"], "Included": "Yes" if params[f"inc_{k}"] else "No", "Data type": f["category"],
+        "Score (0-10)": params[f"w_{k}"],
+        "Share of final score %": round(features.weight(params, k) / total_w * 100, 1),
         "Direction": "Positive" if params[f"dir_{k}"] > 0 else "Inverse", "Lookback (days)": params[f"win_{k}"],
         "Usable from": d.date() if (d := feat_now[f"sig_{k}"].first_valid_index()) is not None else None,
         "Logic": f["logic"],
@@ -238,7 +245,8 @@ with tab_data:
     elif isinstance(s, pd.DataFrame):
         s, ytitle = features._flow(s, pick, int(params["flow_window"])), f"Net money flow over {params['flow_window']} days (-1 to +1)"
     else:
-        ytitle = "Index level" if pick in ("dxy", "cpi") else ("INR per USD" if pick == "usdinr" else "Percent")
+        ytitle = ("Index level" if pick in ("dxy", "cpi") else "INR per USD" if pick == "usdinr"
+                  else "Shares traded" if pick == "gld_volume" else "Percent")
     chart(go.Figure(go.Scatter(x=s.index, y=s.values, line=dict(color=BLUE, width=2), name=DATA_INPUTS[pick]["label"])),
           yaxis_title=ytitle, showlegend=False)
 
@@ -307,15 +315,19 @@ with tab_bt:
 
         st.markdown("**Scorecard on the last bar** (the sheet 2 view)")
         p_used, last_row = res["params"], f.iloc[-1]
-        tw = sum(p_used[f"w_{k}"] for k in FACTORS if pd.notna(last_row[f"sig_{k}"])) or 1
+        tw = sum(features.weight(p_used, k) for k in FACTORS if pd.notna(last_row[f"sig_{k}"])) or 1
         card = pd.DataFrame([{
             "Factor": FACTORS[k]["label"], "Raw value": last_row[f"raw_{k}"], "Normalised reading": last_row[f"z_{k}"],
-            "Signal (-1 to +1)": last_row[f"sig_{k}"], "Score (0-10)": p_used[f"w_{k}"],
-            "Contribution to final": p_used[f"w_{k}"] * last_row[f"sig_{k}"] / tw,
+            "Signal (-1 to +1)": last_row[f"sig_{k}"], "Score (0-10)": features.weight(p_used, k),
+            "Contribution to final": features.weight(p_used, k) * last_row[f"sig_{k}"] / tw,
         } for k in FACTORS])
         st.dataframe(card.round(3), hide_index=True, width="stretch")
         decision = "Long" if last_row["score"] >= p_used["entry_threshold"] else ("Short" if p_used["allow_short"] and last_row["score"] <= -p_used["entry_threshold"] else "No new trade")
-        st.caption(f"Final score on {f.index[-1].date()}: {last_row['score']:+.3f}. Decision: {decision}.")
+        vol_note = ""
+        if p_used["use_rvol"] or p_used["use_vdu"]:
+            ok = last_row["vol_ok_long"] if decision == "Long" else last_row["vol_ok_short"] if decision == "Short" else True
+            vol_note = f" Volume z-score {last_row['rv_z']:+.2f}" + ("" if ok else "; the volume filter blocks this entry") + "."
+        st.caption(f"Final score on {f.index[-1].date()}: {last_row['score']:+.3f}. Decision: {decision}.{vol_note}")
 
         yearly = curves.resample("YE").last()
         yearly = (yearly / yearly.shift(1).fillna(curves.iloc[0]) - 1) * 100
@@ -335,6 +347,39 @@ with tab_bt:
         with st.expander(f"Trade log ({len(trades)} trades)"):
             st.dataframe(trades.round(2), hide_index=True, width="stretch")
             st.download_button("Download trade log (CSV)", trades.to_csv(index=False), "trades.csv", "text/csv")
+
+    # ---------- Volume filter: does it help? ----------
+    st.divider()
+    st.subheader("Volume filter: does it help?")
+    st.caption("The same sidebar settings run four ways: no volume filter, RVOL spike only, dry-up only, and both. "
+               "The filter only removes entries, so look for fewer losing trades and a higher profit factor without losing much CAGR. "
+               "Logic: VOLUME_SIGNALS_LOGIC.md in the project folder.")
+    VOL_VARIANTS = {"No volume filter": dict(use_rvol=False, use_vdu=False), "RVOL spike only": dict(use_rvol=True, use_vdu=False),
+                    "Dry-up (VDU) only": dict(use_rvol=False, use_vdu=True), "RVOL + VDU": dict(use_rvol=True, use_vdu=True)}
+    VOL_COLOURS = dict(zip(VOL_VARIANTS, (GREY, BLUE, ORANGE, AQUA)))
+    if st.button("Run volume filter comparison"):
+        try:
+            ss["vol_cmp"] = {n: engine.run_backtest(gold, raw, {**params, **v}, **run_kw) for n, v in VOL_VARIANTS.items()}
+            ss["vol_cmp_inputs"] = (params, costs, capital, start, end, rf)
+        except ValueError as e:
+            st.error(str(e))
+    vc = ss.get("vol_cmp")
+    if vc is not None:
+        if ss["vol_cmp_inputs"] != (params, costs, capital, start, end, rf):
+            st.warning("Settings have changed since this run. Press the button again to update.")
+        compare_table({n: engine.comparison_row(r) for n, r in vc.items()})
+        fig = go.Figure([go.Scatter(x=r["curves"].index, y=r["curves"][NET], name=n, line=dict(color=VOL_COLOURS[n], width=1.5))
+                         for n, r in vc.items()])
+        chart(fig, 380, yaxis_type="log", yaxis_title="Account value (USD)", title="Account value with and without the volume filter")
+        vf = vc["No volume filter"]["feat"]
+        fig = go.Figure(go.Scatter(x=vf.index, y=vf["rv_z"], name="Volume z-score", line=dict(color=GREY, width=1)))
+        sp = vf[vf["rv_spike"]]
+        for side, name, colour in ((1, "Spike on an up day", AQUA), (-1, "Spike on a down day", RED)):
+            d = sp[sp["rv_side"] == side]
+            fig.add_scatter(x=d.index, y=d["rv_z"], mode="markers", name=name, marker=dict(size=6, color=colour))
+        fig.add_hline(y=params["rv_z"], line=dict(color=RED, dash="dash"), annotation_text="spike threshold")
+        chart(fig, 260, yaxis_title="z-score", title=f"Volume z-score ({'GLD' if params['vol_source'] == 'gld' else 'GC=F'} volume)")
+        st.caption(f"{int(vf['rv_spike'].sum())} RVOL spike days and {int(vf['vdu'].sum())} dry-up days in the test period.")
 
 # ---------------------------------------------------------
 # Tab 3: Regime lab. Phase 1 (rules) and Phase 2a (HMM alone), side by side
@@ -675,3 +720,395 @@ with tab_sweep:
         st.download_button("Download sweep results (CSV)", ranked.to_csv(index=False), "sweep_results.csv", "text/csv")
     elif sw is not None:
         st.warning("No run produced a result. Check the test period.")
+
+
+# ---------------------------------------------------------
+# Tab 5: multi-timeframe backtest and walk-forward training on Binance bars
+# ---------------------------------------------------------
+TF_COLOURS = {"15m": ORANGE, "1h": AQUA, "4h": BLUE, "1d": RED}
+WF, SB = "Walk-forward (tuned, out of sample)", "Sidebar settings (no tuning)"
+
+
+def tf_summary(p):
+    tfs = mtf.ticked(p)
+    if not tfs:
+        return "no timeframe ticked"
+    short = lambda t: TIMEFRAMES[t]["label"].split(" (")[0]
+    slower = ", ".join(short(t) for t in tfs[1:]) or "none"
+    how = "top-down (slower timeframes must agree)" if p["mtf_mode"] == "top_down" else "weighted blend"
+    return f"trades on **{short(tfs[0])}** bars | direction from: {slower} | combining: {how}"
+
+
+def save_strategy_box(p, key):
+    a, b = st.columns([3, 1])
+    name = a.text_input("Save these settings as a strategy (name)", key=f"save_name_{key}", placeholder="e.g. 4h + daily, 1h reversion")
+    b.markdown("&nbsp;")
+    if b.button("Save strategy", key=f"save_btn_{key}", disabled=not name):
+        st.success(f"Saved as '{live.save_strategy(name, p)}'. Pick it in the Live tab.")
+
+
+def trades_by(trades, key, label):
+    if trades.empty:
+        st.info("No trades.")
+        return
+    t = trades.assign(_k=key(trades), _win=trades["net_pnl"] > 0)
+    g = t.groupby("_k").agg(Trades=("net_pnl", "size"), **{"Win rate %": ("_win", "mean"), "Net P&L": ("net_pnl", "sum"),
+                                                            "Avg R": ("r_multiple", "mean")})
+    g["Win rate %"] *= 100
+    st.dataframe(g.rename_axis(label).round(2), width="stretch")
+
+
+with tab_mtf:
+    st.caption("The bot on several timeframes at once, on Binance gold bars (24/7). Slower timeframes set the direction, the fastest "
+               "ticked one times the entry. Tick timeframes in the sidebar under 'Include in backtest'; settings under 'Timeframes'. "
+               "Every other sidebar setting (stops, sizing, volume / regime filters, charges) applies here too. Plan: MULTI_TIMEFRAME_PLAN.md.")
+    a, b = st.columns([2, 3])
+    mtf_symbol = a.selectbox("Market", list(binance.MARKETS), format_func=lambda k: binance.MARKETS[k]["label"], key="mtf_symbol",
+                             help="PAXGUSDT has history from Aug 2020 (best for training). XAUUSDT perpetual only from Dec 2025.")
+    b.markdown("&nbsp;")
+    b.markdown(tf_summary(params))
+    if not ss["cost_preset"].startswith("Binance"):
+        st.info("Charges come from the sidebar. For Binance pick a 'Binance ...' preset under 'Charges and brokerage'. "
+                "Intraday trades chase small moves, so charges decide most results here.")
+    try:
+        bars = load_bars(mtf_symbol, ss["refresh_id"])
+    except Exception as e:
+        bars = None
+        st.error(f"Could not load Binance data: {e}")
+    if bars is not None and not mtf.ticked(params):
+        st.error("No timeframe is ticked. Tick at least one under 'Include in backtest'.")
+    if bars is not None and mtf.ticked(params):
+        bfirst, blast = bars.index[0].date(), bars.index[-1].date()
+        mstart, mend = st.slider("Test period (Binance data)", bfirst, blast, (bfirst, blast), format="YYYY-MM-DD", key="mtf_period")
+        hmm_obj = ss.get("hmm") if params["use_hmm_gate"] else None
+        if params["use_hmm_gate"] and hmm_obj is None:
+            st.warning("'HMM gate' is ticked but no HMM is trained yet, so it does nothing. Train it in the Regime lab tab.")
+        mtf_inputs = (params, costs, capital, mstart, mend, rf, mtf_symbol)
+        c1, c2 = st.columns(2)
+        if c1.button("Run multi-timeframe backtest", type="primary"):
+            with st.spinner("Building signals on every timeframe and running the backtest..."):
+                try:
+                    ss["mtf_res"] = mtf.run(bars, gold, raw, params, costs, capital, str(mstart), str(mend), rf, hmm_obj)
+                    ss["mtf_inputs"] = mtf_inputs
+                except ValueError as e:
+                    st.error(str(e))
+        if c2.button("Does each timeframe add value?", help="Runs: all ticked, each one removed, and each one alone."):
+            tfs = mtf.ticked(params)
+            runs = {"All ticked": params}
+            for tf in tfs if len(tfs) > 1 else []:
+                runs[f"Without {tf}"] = {**params, f"inc_tf_{tf}": False}
+            for tf in tfs if len(tfs) > 1 else []:
+                runs[f"{tf} only"] = {**params, **{f"inc_tf_{k}": k == tf for k in TIMEFRAMES}}
+            bar = st.progress(0.0, text="Running...")
+            out = {}
+            for j, (n, pv) in enumerate(runs.items()):
+                try:
+                    out[n] = engine.comparison_row(mtf.run(bars, gold, raw, pv, costs, capital, str(mstart), str(mend), rf, hmm_obj,
+                                                           with_gross=False))
+                except ValueError:
+                    pass
+                bar.progress((j + 1) / len(runs), text=f"Running... {n}")
+            bar.empty()
+            ss["mtf_loo"], ss["mtf_loo_inputs"] = out, mtf_inputs
+
+        if ss.get("mtf_loo"):
+            st.markdown("**Does each timeframe add value?** (net of charges)")
+            if ss["mtf_loo_inputs"] != mtf_inputs:
+                st.warning("Settings have changed since this run.")
+            keep = ["CAGR %", "Max drawdown %", "Sharpe", "Calmar", "Profit factor", "Trades", "Win rate %", "Longest losing streak",
+                    "Time in market %", "Total charges"]
+            st.dataframe(pd.DataFrame(ss["mtf_loo"]).loc[keep].apply(pd.to_numeric, errors="coerce").round(2), width="stretch")
+            st.caption("If removing a timeframe improves the result, it is not earning its place with these settings.")
+
+        r = ss.get("mtf_res")
+        if r is not None:
+            if ss["mtf_inputs"] != mtf_inputs:
+                st.warning("Settings have changed since this run. Press 'Run multi-timeframe backtest' to update.")
+            m, x, f, curves, trades = r["metrics"], r["extra"], r["feat"], r["curves"], r["trades"]
+            st.caption(f"{f.index[0]:%Y-%m-%d} to {f.index[-1]:%Y-%m-%d %H:%M} UTC, {len(f):,} bars of {r['base_tf']}. "
+                       "Decided on each bar's close, filled at the next bar's open.")
+            c = st.columns(6)
+            c[0].metric("CAGR, net", f"{m.loc['CAGR %', NET]:.2f}%", f"{m.loc['CAGR %', NET] - m.loc['CAGR %', BH]:+.2f}% vs buy and hold")
+            c[1].metric("CAGR, gross", f"{m.loc['CAGR %', GROSS]:.2f}%")
+            c[2].metric("Max drawdown, net", f"{m.loc['Max drawdown %', NET]:.1f}%", f"buy and hold {m.loc['Max drawdown %', BH]:.1f}%",
+                        delta_color="off")
+            c[3].metric("Sharpe, net", f"{m.loc['Sharpe', NET]:.2f}")
+            c[4].metric("Trades", f"{x['Trades']:,}", f"win rate {x['Win rate %']:.0f}%", delta_color="off")
+            c[5].metric("Total charges", f"{x['Total charges']:,.0f}", f"-{x['CAGR lost to charges %']:.2f}% CAGR", delta_color="off")
+            fig = go.Figure([go.Scatter(x=curves.index, y=curves[n], name=n, line=CURVE_STYLE[n]) for n in (NET, GROSS, BH)])
+            chart(fig, 400, yaxis_title="Account value", yaxis_type="log", title="Account value")
+            left, right = st.columns([3, 2])
+            with left:
+                st.dataframe(m.round(2), width="stretch")
+            with right:
+                order = ["Trades", "Win rate %", "Profit factor", "Avg win", "Avg loss", "Avg R", "Avg bars held",
+                         "Longest losing streak", "Time in market %", "Total charges"]
+                st.dataframe(pd.DataFrame({"Value": [f"{x[k]:,.2f}" if isinstance(x[k], float) else f"{x[k]:,}" for k in order]}, index=order),
+                             width="stretch")
+
+            days = st.select_slider("Show the last", [3, 7, 14, 30, 90], value=14, format_func=lambda d: f"{d} days", key="mtf_days")
+            w = f[f.index >= f.index[-1] - pd.Timedelta(days=days)]
+            fig = go.Figure(go.Candlestick(x=w.index, open=w["Open"], high=w["High"], low=w["Low"], close=w["Close"], name="Price",
+                                           showlegend=False))
+            if not trades.empty:
+                tw = trades[trades["entry_date"] >= w.index[0]]
+                fig.add_scatter(x=tw["entry_date"], y=tw["entry_price"], mode="markers", name="Entry",
+                                marker=dict(symbol="triangle-up", size=10, color=AQUA))
+                tx = trades[trades["exit_date"] >= w.index[0]]
+                fig.add_scatter(x=tx["exit_date"], y=tx["exit_price"], mode="markers", name="Exit",
+                                marker=dict(symbol="triangle-down", size=10, color=RED))
+            chart(fig, 380, yaxis_title="USD", title=f"{r['base_tf']} bars with entries and exits", xaxis_rangeslider_visible=False,
+                  hovermode="closest")
+            sig_cols = [c_ for c_ in w.columns if c_.startswith("sig_") and c_[4:] in TIMEFRAMES]
+            fig = go.Figure([go.Scatter(x=w.index, y=w[c_], name=TIMEFRAMES[c_[4:]]["label"].split(" (")[0],
+                                        line=dict(color=TF_COLOURS[c_[4:]], width=1.2)) for c_ in sig_cols])
+            fig.add_scatter(x=w.index, y=w["score"], name="Combined score", line=dict(color="black", width=2))
+            fig.add_hline(y=r["params"]["entry_threshold"], line=dict(color=AQUA, dash="dash"))
+            fig.add_hline(y=-r["params"]["entry_threshold"], line=dict(color=RED, dash="dash"))
+            chart(fig, 300, yaxis_title="Signal (-1 to +1)", yaxis_range=[-1.05, 1.05], title="Signal on each timeframe and the combined score")
+
+            l, rr = st.columns(2)
+            with l:
+                st.markdown("**Trades by hour of entry (UTC)**")
+                trades_by(trades, lambda t: t["entry_date"].dt.hour, "Hour (UTC)")
+            with rr:
+                st.markdown("**Trades by year**")
+                trades_by(trades, lambda t: t["entry_date"].dt.year, "Year")
+            with st.expander(f"Trade log ({len(trades)} trades)"):
+                st.dataframe(trades.round(4), hide_index=True, width="stretch")
+                st.download_button("Download trade log (CSV)", trades.to_csv(index=False), "trades_mtf.csv", "text/csv")
+
+        # ---------- training ----------
+        st.divider()
+        st.subheader("Train the bot (walk-forward)")
+        st.caption("Tunes the chosen parameters on a past window, tests the winner on the next window it has never seen, then rolls "
+                   "forward. Only the unseen test windows count in the result. The winner on the latest window (ending today) is the "
+                   "set to use live. Uses the market and every sidebar setting above as the base.")
+        sweepable = [k for k, s_ in PARAMS.items() if s_["sweep"]]
+        label_of = lambda k: f"{PARAMS[k]['group']}: {PARAMS[k]['label']}"
+        chosen = st.multiselect("Parameters to tune", sweepable, default=["entry_threshold", "sl_atr_mult", "tp_rr", "mtf_win"],
+                                format_func=label_of, key="wf_keys")
+        ranges = {}
+        for k in chosen:
+            s_ = PARAMS[k]
+            cast = int if s_["kind"] == "int" else float
+            a, b, c3 = st.columns(3)
+            lo = a.number_input(f"From: {s_['label']}", cast(s_["lo"]), cast(s_["hi"]), cast(s_["lo"]), step=cast(s_["step"]), key=f"wf_lo_{k}")
+            hi = b.number_input("To", cast(s_["lo"]), cast(s_["hi"]), cast(s_["hi"]), step=cast(s_["step"]), key=f"wf_hi_{k}")
+            step = c3.number_input("Step", cast(s_["step"]), cast(s_["hi"]), cast(s_["step"]), step=cast(s_["step"]), key=f"wf_st_{k}")
+            ranges[k] = (lo, hi, step, s_["kind"])
+        a, b, c3, d, e, g = st.columns(6)
+        n_sets = a.number_input("Parameter sets to try", 5, 500, 20, step=5, key="wf_n")
+        train_days = b.number_input("Training window (days)", 60, 1500, 365, step=30, key="wf_train")
+        test_days = c3.number_input("Test window (days)", 14, 365, 90, step=14, key="wf_test")
+        score_by = d.selectbox("Pick the winner by", list(mtf.SCORERS), key="wf_score")
+        min_tr = e.number_input("Min trades in training", 0, 500, 10, key="wf_min")
+        seed = g.number_input("Random seed", 0, 9999, 0, key="wf_seed")
+        per_set = {"15m": 12, "1h": 3, "4h": 1, "1d": 0.5}[mtf.ticked(params)[0]]
+        st.caption(f"Rough time: about {max(1, round(per_set * (n_sets + 1) / 60))} minute(s) on {mtf.ticked(params)[0]} bars "
+                   "(each parameter set rebuilds the signals on the full history).")
+        if st.button("Train (walk-forward)", type="primary", disabled=not ranges, key="wf_go"):
+            bar = st.progress(0.0, text="Training...")
+            try:
+                ss["mtf_wf"] = mtf.walk_forward(bars, gold, raw, params, ranges, int(n_sets), int(train_days), int(test_days), score_by,
+                                                int(min_tr), costs, capital, rf, hmm_obj, int(seed),
+                                                progress=lambda v: bar.progress(min(v, 1.0), text=f"Training... {v:.0%}"))
+                ss["mtf_wf_inputs"] = (params, costs, mtf_symbol)
+            except ValueError as e_:
+                st.error(str(e_))
+            bar.empty()
+        wf = ss.get("mtf_wf")
+        if wf is not None:
+            if ss["mtf_wf_inputs"] != (params, costs, mtf_symbol):
+                st.warning("Sidebar settings have changed since this training run.")
+            wm = wf["metrics"]
+            c = st.columns(4)
+            c[0].metric("CAGR, tuned (unseen data)", f"{wm.loc['CAGR %', WF]:.2f}%", f"{wm.loc['CAGR %', WF] - wm.loc['CAGR %', SB]:+.2f}% vs untuned")
+            c[1].metric("Max drawdown, tuned", f"{wm.loc['Max drawdown %', WF]:.1f}%", f"untuned {wm.loc['Max drawdown %', SB]:.1f}%",
+                        delta_color="off")
+            c[2].metric("Sharpe, tuned", f"{wm.loc['Sharpe', WF]:.2f}", f"buy and hold {wm.loc['Sharpe', BH]:.2f}", delta_color="off")
+            c[3].metric("Trades (unseen data)", f"{wf['trade_stats']['Trades']:,}", f"win rate {wf['trade_stats']['Win rate %']:.0f}%",
+                        delta_color="off")
+            cv = wf["curves"]
+            fig = go.Figure([go.Scatter(x=cv.index, y=cv[n], name=n, line=sty) for n, sty in
+                             ((WF, dict(color=BLUE, width=2)), (SB, dict(color=GREY, width=1.5)), (BH, dict(color=GREY, width=1, dash="dot")))])
+            chart(fig, 380, yaxis_type="log", yaxis_title="Account value", title="Out-of-sample account value (test windows joined)")
+            st.dataframe(wm.round(2), width="stretch")
+            st.markdown("**Each fold: what won in training and how it did on the next, unseen window**")
+            st.dataframe(wf["folds"].round(3), hide_index=True, width="stretch")
+            a_, b_ = wf["latest_window"]
+            st.markdown(f"**Settings to use live:** winner on the latest training window ({a_:%Y-%m-%d} to {b_:%Y-%m-%d}), "
+                        f"{score_by} {wf['latest_score']:.2f}")
+            if wf["latest_params"]:
+                st.dataframe(pd.DataFrame([wf["latest_params"]]), hide_index=True)
+                st.button("Load these settings into the sidebar", on_click=load_into_sidebar, args=(wf["latest_params"],), key="wf_load")
+            else:
+                st.info("The sidebar settings themselves won on the latest window (or no set had enough trades).")
+            st.caption("Load them into the sidebar, then save them as a strategy below to run them in the Live tab. "
+                       "If the tuned result on unseen data is not better than untuned, the tuning is fitting noise.")
+
+        st.divider()
+        save_strategy_box(params, "mtf")
+
+# ---------------------------------------------------------
+# Tab 6: live paper trading on the Binance feed
+# ---------------------------------------------------------
+with tab_live:
+    st.caption("Paper trading on the live Binance gold feed. Nothing is sent to the exchange. The session is the same backtest "
+               "engine run from the moment you press Start to the last closed bar, so live and backtest can be compared directly. "
+               "It keeps going when the browser is closed, because the result is recalculated from the start time. For a log "
+               "without the browser, run  python live_runner.py  in a terminal.")
+    sess = live.get_session()
+    if sess is None:
+        CURRENT = "Current sidebar settings"
+        a, b = st.columns(2)
+        pick = a.selectbox("Strategy", [CURRENT] + live.list_strategies(), key="live_pick",
+                           help="Save strategies in the Multi-timeframe tab (or below).")
+        sym = b.selectbox("Live market", list(binance.MARKETS), format_func=lambda k: binance.MARKETS[k]["label"], key="live_symbol")
+        p_sel = params if pick == CURRENT else live.load_strategy(pick)
+        c1, c2 = st.columns(2)
+        lcap = c1.number_input("Paper capital (USDT)", 100, 10_000_000, 10_000, step=1_000, key="live_cap")
+        presets = list(COST_PRESETS)
+        default = "Binance PAXGUSDT spot (0.1% fee)" if sym == "PAXGUSDT" else "Binance XAUUSDT perpetual (0.05% taker)"
+        lpreset = c2.selectbox("Charges", presets, index=presets.index(default), key=f"live_preset_{sym}")
+        factors_on = ", ".join(FACTORS[k]["label"] for k in FACTORS if p_sel[f"inc_{k}"] and p_sel[f"w_{k}"] > 0) or "none"
+        filters_on = ", ".join(n for n, on in (("RVOL spike", p_sel["use_rvol"]), ("volume dry-up", p_sel["use_vdu"]),
+                                               ("regime rules", p_sel["use_regime"]), ("HMM gate", p_sel["use_hmm_gate"])) if on) or "none"
+        st.markdown(f"**{pick}:** {tf_summary(p_sel)}  \n"
+                    f"Factors in the daily score: {factors_on}  \n"
+                    f"Filters: {filters_on} | entry at score {p_sel['entry_threshold']:+.2f}, stop {p_sel['sl_atr_mult']} x ATR, "
+                    f"target {p_sel['tp_rr']} x stop, shorts {'on' if p_sel['allow_short'] else 'off'}")
+        if sym == "PAXGUSDT" and p_sel["allow_short"]:
+            st.warning("PAXGUSDT is spot and cannot be shorted on Binance. Short paper trades are shown, but you could not place them.")
+        if not mtf.ticked(p_sel):
+            st.error("This strategy has no timeframe ticked.")
+        elif st.button("Start live paper session", type="primary"):
+            live.start_session(pick, p_sel, sym, COST_PRESETS[lpreset], float(lcap))
+            st.rerun()
+        st.divider()
+        save_strategy_box(params, "live")
+    else:
+        sp = {**DEFAULT_PARAMS, **sess["params"]}
+        st.markdown(f"**Running:** strategy '{sess['strategy']}' on **{sess['symbol']}** since {sess['started']} UTC, "
+                    f"paper capital {sess['capital']:,.0f}  \n{tf_summary(sp)}")
+        a, b, c3, d = st.columns(4)
+        auto = a.toggle("Auto refresh", value=True, key="live_auto")
+        every = b.selectbox("Strategy panel refresh", [2, 5, 15, 30, 60, 120], index=1, format_func=lambda v: f"every {v} seconds",
+                            key="live_every",
+                            help="Signals are only rebuilt when a new 15m bar closes; between bars this just re-checks the live price against the position.")
+        rec = c3.toggle("Record ticks to disk", value=False, key="live_rec",
+                        help="Saves trades and 1-second quote snapshots to data/ticks/<symbol>_<date>.csv, for later study.")
+        if d.button("Stop session"):
+            live.stop_session()
+            st.rerun()
+        stream = ticks.get_stream(sess["symbol"])
+        stream.record = bool(rec)
+
+        @st.fragment(run_every="1s" if auto else None)
+        def tick_panel():
+            """Tick by tick: best bid / ask, trades, and the bar in progress, refreshed every second."""
+            stt = stream.status()
+            if not stt["connected"]:
+                st.warning(f"Tick feed not connected ({stt['error'] or 'connecting...'}). The REST price is used instead. "
+                           f"Reconnect attempts: {stt['reconnects']}. Binance blocks US-hosted servers (HTTP 451).")
+                return
+            fb = stream.forming()
+            c = st.columns(6)
+            c[0].metric("Best bid", f"{stream.bid:,.2f}" if stream.bid == stream.bid else "-")
+            c[1].metric("Best ask", f"{stream.ask:,.2f}" if stream.ask == stream.ask else "-",
+                        f"spread {stream.ask - stream.bid:.2f}" if stream.ask == stream.ask else None, delta_color="off")
+            c[2].metric("Last trade", f"{stream.last:,.2f}" if stream.last == stream.last else "waiting",
+                        f"{stream.last_qty:g} oz, {stream.last_side}" if stream.last == stream.last else None, delta_color="off")
+            c[3].metric("Ticks per second", f"{stt['rate']:.1f}", f"{stt['quotes']:,} quotes, {stt['trades']:,} trades", delta_color="off")
+            c[4].metric("Last tick", f"{stt['age']:.1f}s ago", f"{stt['reconnects']} reconnects", delta_color="off")
+            c[5].metric("15m bar so far", f"{fb['close']:,.2f}" if fb else "-",
+                        f"O {fb['open']:,.2f}  H {fb['high']:,.2f}  L {fb['low']:,.2f}" if fb else None, delta_color="off")
+            left, right = st.columns([3, 2])
+            mids = stream.recent_mid(300)
+            with left:
+                if len(mids) > 1:
+                    fig = go.Figure(go.Scatter(x=mids["time"], y=mids["mid"], mode="lines", line=dict(color=BLUE, width=1.2, shape="hv"), name="Mid"))
+                    chart(fig, 240, title="Last 5 minutes, every quote change", showlegend=False, yaxis_title="USD per oz")
+                else:
+                    st.caption("Waiting for quotes...")
+            with right:
+                st.caption("Trade tape (aggressor = the side that hit the book)")
+                tp = stream.tape(8)
+                if len(tp):
+                    st.dataframe(tp.round(4), hide_index=True, width="stretch")
+                else:
+                    st.caption("No trades yet (spot gold trades only every few seconds).")
+
+        tick_panel()
+
+        @st.fragment(run_every=f"{every}s" if auto else None)
+        def live_panel():
+            try:
+                snap = live.snapshot(sess, gold, raw, ss.get("hmm") if sp["use_hmm_gate"] else None)
+            except Exception as e:
+                st.error(f"Live update failed: {type(e).__name__}: {e}")
+                return
+            live.log_events(snap)
+            pr, pos, f, closed = snap["price"], snap["position"], snap["feat"], snap["closed"]
+            realised = closed["net_pnl"].sum() if not closed.empty else 0.0
+            eq_live = sess["capital"] + realised + (pos["unrealised_pnl"] if pos is not None else 0.0)
+            c = st.columns(5)
+            c[0].metric(f"{sess['symbol']} live", f"{pr['price']:,.2f}", f"bid {pr['bid']:,.2f} / ask {pr['ask']:,.2f} ({pr.get('source')})", delta_color="off")
+            c[1].metric("Last closed bar", f"{snap['last_bar']:%H:%M} UTC", f"{snap['base_tf']} bars, next close {snap['next_close']:%H:%M}",
+                        delta_color="off")
+            c[2].metric("Position", "Flat" if pos is None else f"{pos['side']} {pos['qty']:.4f}",
+                        None if pos is None else f"entry {pos['entry_price']:,.2f}", delta_color="off")
+            c[3].metric("Unrealised P&L", "-" if pos is None else f"{pos['unrealised_pnl']:+,.2f}")
+            c[4].metric("Paper equity", f"{eq_live:,.2f}", f"{(eq_live / sess['capital'] - 1) * 100:+.2f}% since start")
+            st.markdown(f"**Signal on the last closed bar:** {live.decision_text(f, sp)}")
+            if pr.get("source") != "websocket":
+                st.warning(f"Price source: {pr.get('source')}. " + (f"Live price unavailable ({pr['error']}). " if "error" in pr else "")
+                           + "Stops and fills use only closed bars until the tick feed connects.")
+
+            row = f.iloc[-1]
+            sig_rows = [{"Layer": TIMEFRAMES[t]["label"], "Signal (-1 to +1)": row.get(f"sig_{t}")} for t in mtf.ticked(sp)]
+            sig_rows.append({"Layer": "Combined score", "Signal (-1 to +1)": row["score"]})
+            l, r_ = st.columns([2, 3])
+            with l:
+                st.dataframe(pd.DataFrame(sig_rows).round(3), hide_index=True, width="stretch")
+                st.caption(f"Volume z-score {row['rv_z']:+.2f}" + (f" | market type: {row['regime_label']}" if sp["use_regime"] else "")
+                           + (" | volume filter blocks longs" if not row["vol_ok_long"] else ""))
+            with r_:
+                fl = snap["feat_live"]
+                w = fl[fl.index >= fl.index[-1] - pd.Timedelta(days=3)]
+                fig = go.Figure(go.Candlestick(x=w.index, open=w["Open"], high=w["High"], low=w["Low"], close=w["Close"],
+                                               showlegend=False, name="Price"))
+                fig.add_hline(y=pr["price"], line=dict(color=BLUE, dash="dot"), annotation_text="live")
+                if snap["started"] >= w.index[0]:
+                    fig.add_vline(x=snap["started"], line=dict(color=GREY, dash="dash"))
+                res = snap["res"]
+                if res is not None and not res["trades"].empty:
+                    t = res["trades"]
+                    fig.add_scatter(x=t["entry_date"], y=t["entry_price"], mode="markers", name="Entry",
+                                    marker=dict(symbol="triangle-up", size=11, color=AQUA))
+                    tc = t[t["exit_reason"] != "End of test"]
+                    fig.add_scatter(x=tc["exit_date"], y=tc["exit_price"], mode="markers", name="Exit",
+                                    marker=dict(symbol="triangle-down", size=11, color=RED))
+                if pos is not None:
+                    p_ = res["params"]
+                    atr_prev = f["ATR"].loc[:pos["entry_date"]]
+                    stop_dist = p_["sl_atr_mult"] * (atr_prev.iloc[-2] if len(atr_prev) > 1 else atr_prev.iloc[-1])
+                    sgn = 1 if pos["side"] == "Long" else -1
+                    if p_["use_sl"]:
+                        fig.add_hline(y=pos["entry_price"] - sgn * stop_dist, line=dict(color=RED, width=1), annotation_text="stop")
+                    if p_["use_tp"]:
+                        fig.add_hline(y=pos["entry_price"] + sgn * stop_dist * p_["tp_rr"], line=dict(color=AQUA, width=1),
+                                      annotation_text="target")
+                chart(fig, 340, title=f"Last 3 days, {snap['base_tf']} bars; the last bar is still forming (dashed line = session start)",
+                      xaxis_rangeslider_visible=False, hovermode="closest")
+            if snap["equity"] is not None and len(snap["equity"]) > 1:
+                fig = go.Figure(go.Scatter(x=snap["equity"].index, y=snap["equity"].values, line=dict(color=BLUE, width=2), name="Paper equity"))
+                chart(fig, 220, yaxis_title="Equity", title="Paper equity since start (closed bars)", showlegend=False)
+            st.markdown(f"**Closed paper trades ({len(closed)})**")
+            if closed.empty:
+                st.caption("None yet.")
+            else:
+                st.dataframe(closed.round(4), hide_index=True, width="stretch")
+            st.caption(f"Updated {pd.Timestamp.now(tz='UTC'):%H:%M:%S} UTC. Entries and exits are also logged to data/live/events.csv.")
+
+        live_panel()

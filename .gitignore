@@ -4,3 +4,6 @@ __pycache__/
 venv/
 .env
 .streamlit/secrets.toml
+data/binance/
+data/live/
+data/ticks/

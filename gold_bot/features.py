@@ -154,11 +154,79 @@ def build_features(gold, raw, p):
     num = pd.Series(0.0, index=df.index)
     den = pd.Series(0.0, index=df.index)
     for key in FACTORS:
-        w, s = float(p[f"w_{key}"]), df[f"sig_{key}"]
+        w, s = weight(p, key), df[f"sig_{key}"]
         num += w * s.fillna(0.0)
         den += w * s.notna()
     df["score"] = (num / den.where(den > 0)).where(df["sig_tech"].notna())
-    return add_regime(df, p)
+    return add_volume(add_regime(df, p), raw, p)
+
+
+def weight(p, key):
+    """Score a factor counts with: its 0-10 score, or 0 when it is unticked in 'Include in backtest'."""
+    return float(p[f"w_{key}"]) if p.get(f"inc_{key}", True) else 0.0
+
+
+def _any_recent(mask, bars):
+    """True when `mask` was True on any of the last `bars` bars, today included."""
+    return mask.astype(float).rolling(int(bars), min_periods=1).max().astype(bool)
+
+
+def add_volume(df, raw, p):
+    """Volume signals from VOLUME_SIGNALS_LOGIC.md, known at each bar's close.
+
+    rv_z       volume z-score vs the PREVIOUS rv_window days (today excluded, so a spike cannot lift its own average)
+    rv_spike   rv_z >= rv_z threshold; rv_side = +1 if that day closed up, -1 if down
+    vdu        volume below its vdu_pct percentile of the previous vdu_window days AND a tight base
+               (high-low range of the last vdu_base_days bars <= vdu_atr_mult x simple ATR 20)
+    vol_ok_long / vol_ok_short   the entry gate the backtest reads (True = allowed)
+    """
+    if p.get("vol_source", "gld") == "gld" and "gld_volume" in raw:
+        s = raw["gld_volume"]
+        v = s[~s.index.duplicated(keep="last")].reindex(df.index)  # no forward fill: a missing day has no volume
+    else:
+        v = df["Volume"]
+    v = v.where(v > 0)
+    df["vol_used"] = v
+
+    # RVOL z-score spike
+    n = int(p["rv_window"])
+    prev = v.shift(1).rolling(n, min_periods=max(5, int(0.8 * n)))
+    mean, std = prev.mean(), prev.std()
+    z = (v - mean) / std.replace(0, np.nan)
+    side = np.sign(df["Close"].pct_change())
+    spike = z >= p["rv_z"]
+    df["rv_z"], df["rv_x"] = z, v / mean
+    df["rv_spike"], df["rv_side"] = spike, side.where(spike, 0.0)
+    up_recent = _any_recent(spike & (side > 0), p["rv_lookback"])
+    dn_recent = _any_recent(spike & (side < 0), p["rv_lookback"])
+    rv_known = mean.notna()
+
+    # Volume dry-up inside a tight base
+    w = int(p["vdu_window"])
+    q = v.shift(1).rolling(w, min_periods=int(0.8 * w)).quantile(p["vdu_pct"] / 100)
+    prev_c = df["Close"].shift(1)
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - prev_c).abs(), (df["Low"] - prev_c).abs()], axis=1).max(axis=1)
+    atr20 = tr.rolling(20, min_periods=20).mean()
+    b = int(p["vdu_base_days"])
+    base = df["High"].rolling(b).max() - df["Low"].rolling(b).min()
+    vdu = (v < q) & (base <= p["vdu_atr_mult"] * atr20)
+    df["vdu"], df["vdu_ratio"], df["vdu_base_atr"] = vdu, v / q, base / atr20
+    vdu_recent = _any_recent(vdu, p["vdu_lookback"])
+    vdu_known = q.notna()
+
+    ok_long = pd.Series(True, index=df.index)
+    ok_short = pd.Series(True, index=df.index)
+    if p.get("use_rvol", False):
+        if p["rv_mode"] == "confirm":
+            ok_long &= up_recent | ~rv_known
+            ok_short &= dn_recent | ~rv_known
+        else:
+            ok_long &= ~dn_recent
+            ok_short &= ~up_recent
+    if p.get("use_vdu", False):
+        ok_long &= vdu_recent | ~vdu_known  # before the volume history exists the filter does nothing
+    df["vol_ok_long"], df["vol_ok_short"] = ok_long, ok_short
+    return df
 
 
 UP, DOWN, MIXED, UNKNOWN = "Uptrend", "Downtrend", "Mixed", "Not enough history"

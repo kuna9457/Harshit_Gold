@@ -4,7 +4,7 @@ import itertools
 import numpy as np
 import pandas as pd
 
-from .config import COST_PRESETS, DEFAULT_PARAMS
+from .config import COST_PRESETS, DEFAULT_PARAMS, FACTORS
 from .features import add_hmm, build_features, regime_gate
 
 ZERO_COSTS = COST_PRESETS["No charges (gross)"]
@@ -15,7 +15,8 @@ def _simulate(feat, p, c, capital):
     idx = feat.index
     O, H, L, C = (feat[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
     ATR, S = feat["ATR"].to_numpy(float), feat["score"].to_numpy(float)
-    gap_days = np.r_[0, np.diff(idx.values).astype("timedelta64[D]").astype(int)]
+    # time between bars in days (fractions on intraday bars), used to charge overnight financing
+    gap_days = np.r_[0.0, np.diff(idx.values).astype("timedelta64[s]").astype(float) / 86400]
     n = len(idx)
 
     # Phase 1 regime filter inputs (decided on the signal bar's close, like the score)
@@ -31,6 +32,10 @@ def _simulate(feat, p, c, capital):
         HM = np.nan_to_num(feat["hmm_mult"].to_numpy(float), nan=1.0)
         ER = feat["hmm_exp_ret"].to_numpy(float)
     HST = feat["hmm_state"].to_numpy(object) if "hmm_state" in feat else np.full(n, "", object)
+    # Volume filter (RVOL spike / dry-up), decided on the signal bar's close
+    use_vol = (p.get("use_rvol") or p.get("use_vdu")) and "vol_ok_long" in feat
+    if use_vol:
+        VL, VS = feat["vol_ok_long"].to_numpy(bool), feat["vol_ok_short"].to_numpy(bool)
 
     entry_th, exit_th = p["entry_threshold"], p["exit_threshold"]
     use_sl, use_tp, allow_short = p["use_sl"], p["use_tp"], p["allow_short"]
@@ -140,6 +145,8 @@ def _simulate(feat, p, c, capital):
                 mult_long = 0.0 if ER[i] < 0 else mult_long
                 mult_short = 0.0 if ER[i] > 0 else mult_short
             go_long, go_short = go_long and mult_long > 0, go_short and mult_short > 0
+        if use_vol:
+            go_long, go_short = go_long and VL[i], go_short and VS[i]
         if qty == 0:
             if cooldown > 0:
                 cooldown -= 1
@@ -162,8 +169,8 @@ def _simulate(feat, p, c, capital):
     return eq, pd.DataFrame(trades), total_cost
 
 
-def metrics(equity, rf=0.04):
-    """Return and risk statistics for a daily equity curve."""
+def metrics(equity, rf=0.04, ppy=252):
+    """Return and risk statistics for an equity curve with `ppy` bars a year (252 for daily bars)."""
     eq = equity.dropna()
     ret = eq.pct_change().dropna()
     years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
@@ -171,14 +178,14 @@ def metrics(equity, rf=0.04):
     cagr = total ** (1 / years) - 1 if total > 0 else -1.0
     dd = eq / eq.cummax() - 1
     sd, downside = ret.std(), ret[ret < 0].std()
-    excess = ret.mean() - rf / 252
+    excess = ret.mean() - rf / ppy
     return {
         "Total return %": (total - 1) * 100,
         "CAGR %": cagr * 100,
         "Max drawdown %": dd.min() * 100,
-        "Volatility %": sd * np.sqrt(252) * 100,
-        "Sharpe": np.sqrt(252) * excess / sd if sd > 0 else 0.0,
-        "Sortino": np.sqrt(252) * excess / downside if downside and downside > 0 else 0.0,
+        "Volatility %": sd * np.sqrt(ppy) * 100,
+        "Sharpe": np.sqrt(ppy) * excess / sd if sd > 0 else 0.0,
+        "Sortino": np.sqrt(ppy) * excess / downside if downside and downside > 0 else 0.0,
         "Calmar": cagr / abs(dd.min()) if dd.min() < 0 else 0.0,
     }
 
@@ -228,7 +235,8 @@ def by_group(trades, key):
 
 
 SWITCH_PARAMS = dict(use_sl=False, use_tp=False, sizing_mode="allocation", alloc_pct=100.0, max_leverage=1.0,
-                     entry_threshold=0.5, exit_threshold=0.0, cooldown_bars=0, scale_by_score=False, use_regime=False)
+                     entry_threshold=0.5, exit_threshold=0.0, cooldown_bars=0, scale_by_score=False, use_regime=False,
+                     use_rvol=False, use_vdu=False)
 
 
 def run_switch(feat, signal, costs=None, capital=100_000, start=None, end=None, rf=0.04, allow_short=False):
@@ -249,29 +257,37 @@ def comparison_row(res):
             "Time in market %": x["Time in market %"], "Total charges": x["Total charges"]}
 
 
-def run_backtest(gold, raw, params=None, costs=None, capital=100_000, start=None, end=None, rf=0.04, feat=None, hmm=None):
+def run_backtest(gold, raw, params=None, costs=None, capital=100_000, start=None, end=None, rf=0.04, feat=None, hmm=None,
+                 ppy=252, with_gross=True, min_bars=30):
     """Full run. Returns features, equity curves (net, gross, buy and hold), trade log and metric tables.
-    `hmm` (a trained regime_hmm.walk_forward result) adds the HMM state columns used by the Phase 2b gate."""
+    `hmm` (a trained regime_hmm.walk_forward result) adds the HMM state columns used by the Phase 2b gate.
+    `feat` lets a caller pass ready-made bars + score (the multi-timeframe and live code do this); `ppy` is bars a year.
+    with_gross=False skips the second, charge-free run (faster, used when training)."""
     p = {**DEFAULT_PARAMS, **(params or {})}
     c = {**ZERO_COSTS, **(costs or {})}
     if feat is None:
+        if not any(p.get(f"inc_{k}", True) and p[f"w_{k}"] > 0 for k in FACTORS):
+            raise ValueError("No factor is ticked (or every ticked factor has a score of 0). Tick at least one factor.")
         feat = build_features(gold, raw, p)
     if hmm is not None:
         feat = add_hmm(feat, hmm, p)
     # Indicators are built on full history, then the test window is cut, so no warm-up is lost.
     f = feat.loc[start:end]
-    f = f.loc[f["score"].first_valid_index():]
-    if len(f) < 30:
+    first = f["score"].first_valid_index()
+    if first is None:
+        raise ValueError("No signal in the selected date range (not enough history for the lookbacks yet).")
+    f = f.loc[first:]
+    if len(f) < min_bars:
         raise ValueError("Not enough data in the selected date range.")
 
     net, trades, total_cost = _simulate(f, p, c, capital)
-    gross, _, _ = _simulate(f, p, ZERO_COSTS, capital)
+    gross = _simulate(f, p, ZERO_COSTS, capital)[0] if with_gross else net
     curves = pd.DataFrame({
         "Strategy (net of charges)": net["equity"],
         "Strategy (gross)": gross["equity"],
         "Buy and hold gold": capital * f["Close"] / f["Close"].iloc[0],
     })
-    table = pd.DataFrame({name: metrics(curves[name], rf) for name in curves})
+    table = pd.DataFrame({name: metrics(curves[name], rf, ppy) for name in curves})
     lev = net["notional"] / net["equity"].clip(lower=1e-9)
     extra = {
         **trade_stats(trades),

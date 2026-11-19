@@ -63,6 +63,12 @@ DATA_INPUTS = {
         note="PROXY: money flow from GLD price x volume. SPDR no longer serves the holdings history "
              "file. Drop real tonnage in data/overrides/gold_etf.csv (date,value) to replace it.",
     ),
+    "gld_volume": dict(
+        label="Gold ETF volume (GLD shares traded)", category=DAILY, source="Yahoo Finance (GLD)",
+        native="Daily", lag_days=0, proxy=True,
+        note="Used by the volume filter. ETF volume has no futures roll, so it avoids the fake spikes and "
+             "dry-ups that GC=F front-month volume shows around every contract roll. Starts Nov 2004.",
+    ),
     "bond_flow": dict(
         label="US bond inflow / outflow (TLT + IEF)", category=DAILY, source="Yahoo Finance (TLT, IEF OHLCV)",
         native="Official fund flows are weekly (ICI) and monthly (TIC)", lag_days=0, proxy=True,
@@ -124,9 +130,40 @@ G_WEIGHT, G_DIR, G_FEAT, G_TECH, G_MACRO = "Factor scores (0-10)", "Factor direc
 G_SIGNAL, G_RISK, G_SIZE = "Entry and exit", "Risk management", "Position sizing"
 G_REGIME = "Regime filter (Phase 1, rule based)"
 G_HMM = "HMM gate (Phase 2b, needs a trained HMM)"
-GROUP_ORDER = [G_WEIGHT, G_DIR, G_FEAT, G_TECH, G_MACRO, G_SIGNAL, G_RISK, G_SIZE, G_REGIME, G_HMM]
+G_INCLUDE = "Include in backtest (tick to use)"
+G_VOLUME = "Volume filter (RVOL z-score + dry-up)"
+G_TF = "Timeframes (multi-horizon, Binance tabs)"
+GROUP_ORDER = [G_INCLUDE, G_WEIGHT, G_DIR, G_FEAT, G_TECH, G_MACRO, G_SIGNAL, G_RISK, G_SIZE, G_VOLUME, G_TF, G_REGIME, G_HMM]
+
+# Timeframes of the multi-horizon bot. The fastest ticked one is the trading timeframe.
+TIMEFRAMES = {
+    "15m": dict(label="15 minutes", minutes=15, weight=4),
+    "1h": dict(label="1 hour", minutes=60, weight=6),
+    "4h": dict(label="4 hours", minutes=240, weight=6),
+    "1d": dict(label="Daily (macro factors + daily technicals)", minutes=1440, weight=8),
+}
 
 PARAMS = {}
+# Tick boxes: which parts of the strategy take part in the run. Unticked factor = left out of the score
+# (same as a score of 0, but the slider value is kept for when it is ticked again).
+for _k, _f in FACTORS.items():
+    PARAMS[f"inc_{_k}"] = _p(G_INCLUDE, _f["label"], "bool", True,
+                             help="Untick to leave this factor out of the final score.")
+PARAMS["use_rvol"] = _p(G_INCLUDE, "Volume filter: RVOL z-score spike", "bool", True,
+                        help="Volume far above normal = a big player is active. Settings in the 'Volume filter' group.")
+PARAMS["use_vdu"] = _p(G_INCLUDE, "Volume filter: volume dry-up (VDU) before longs", "bool", True,
+                       help="Longs need a quiet, tight base (volume near its lows) shortly before entry. "
+                            "Settings in the 'Volume filter' group.")
+for _k, _t in TIMEFRAMES.items():
+    PARAMS[f"inc_tf_{_k}"] = _p(G_INCLUDE, f"Timeframe: {_t['label']}", "bool", True,
+                                help="Multi-timeframe and Live tabs only. The fastest ticked timeframe is the one the bot trades on; "
+                                     "slower ones set the direction. The daily Backtest tab always uses daily bars.")
+PARAMS["use_regime"] = _p(G_INCLUDE, "Regime filter (Phase 1, rule based)", "bool", False,
+                          help="On: every entry is checked against the market type (trend + volatility) first. "
+                               "Settings in the 'Regime filter' group. Off: no regime detection.")
+PARAMS["use_hmm_gate"] = _p(G_INCLUDE, "HMM gate (Phase 2b)", "bool", False,
+                            help="On: entry size is multiplied by the HMM state multiplier. Needs 'Train HMM' in the Regime lab tab first. "
+                                 "On intraday bars the daily HMM state of the previous day is used.")
 for _k, _f in FACTORS.items():
     PARAMS[f"w_{_k}"] = _p(G_WEIGHT, _f["label"], "int", _f["weight"], 0, 10, 1,
                            help="0 switches the factor off. Scores are relative: final score = sum(score x signal) / sum(score).")
@@ -183,10 +220,44 @@ PARAMS.update({
     "scale_by_score": _p(G_SIZE, "Smaller quantity on weaker score", "bool", False,
                          help="Scales quantity by |final score| / 0.5, capped at 1. Sheet 2: 'Buy (less Qty)'."),
 
+    # Volume signals (VOLUME_SIGNALS_LOGIC.md). They only filter entries; exits are unchanged.
+    "vol_source": _p(G_VOLUME, "Volume series", "choice", "gld", choices=["gld", "futures"],
+                     help="gld: GLD ETF volume (no roll effect, from Nov 2004). futures: GC=F front-month volume "
+                          "(longer history, but volume jumps and collapses around every contract roll)."),
+    "rv_window": _p(G_VOLUME, "RVOL: volume baseline (days)", "int", 20, 5, 250, 5,
+                    help="Mean and std of the PREVIOUS N days' volume (today excluded)."),
+    "rv_z": _p(G_VOLUME, "RVOL: spike when volume z-score is at or above", "float", 2.5, 1.0, 10.0, 0.25,
+               help="z = (volume - mean) / std. The doc suggests 2.0-2.5 for gold (3.0 gives few events)."),
+    "rv_mode": _p(G_VOLUME, "RVOL: how the spike is used", "choice", "block_against", choices=["block_against", "confirm"],
+                  help="block_against: skip a long if a recent spike day closed DOWN (a short if it closed up). "
+                       "confirm: a long NEEDS a recent spike on an up day (a short needs one on a down day). "
+                       "confirm cuts many more trades."),
+    "rv_lookback": _p(G_VOLUME, "RVOL: a spike counts for (bars)", "int", 3, 1, 30, 1,
+                      help="A spike on any of the last N bars, the signal bar included."),
+    "vdu_window": _p(G_VOLUME, "VDU: volume percentile window (days)", "int", 50, 10, 250, 5),
+    "vdu_pct": _p(G_VOLUME, "VDU: dry-up = volume below this percentile", "float", 10.0, 1.0, 30.0, 1.0,
+                  help="Of the previous N days' volume. Doc default 5, suggested 10 for gold."),
+    "vdu_base_days": _p(G_VOLUME, "VDU: consolidation length (days)", "int", 10, 3, 60, 1),
+    "vdu_atr_mult": _p(G_VOLUME, "VDU: max consolidation range (x ATR 20)", "float", 2.5, 0.5, 10.0, 0.25,
+                       help="The high-low range of the base must be at most this many ATRs. Doc default 3.0, suggested 2.5 for gold."),
+    "vdu_lookback": _p(G_VOLUME, "VDU: a dry-up counts for (bars)", "int", 20, 1, 60, 1,
+                       help="A long is allowed if a dry-up happened on any of the last N bars."),
+
+    # Multi-horizon: how the ticked timeframes are combined into one score on the trading timeframe.
+    "mtf_mode": _p(G_TF, "How timeframes are combined", "choice", "top_down", choices=["top_down", "weighted"],
+                   help="top_down: the fastest timeframe gives the signal, and every slower ticked timeframe must point the same way "
+                        "(otherwise the score is 0). weighted: score = sum(weight x signal) / sum(weight), like the factors."),
+    "mtf_agree_min": _p(G_TF, "Top-down: slower timeframe signal needed", "float", 0.0, 0.0, 0.9, 0.05,
+                        help="A slower timeframe agrees when its signal points the same way and is at least this strong."),
+    "mtf_style_15m": _p(G_TF, "15m signal style", "choice", "momentum", choices=["momentum", "reversion"],
+                        help="momentum: price above its average = bullish. reversion: price stretched above its average = bearish "
+                             "(expects a snap back). On PAXGUSDT 2021-2026, 15m and 1h moves tended to revert."),
+    "mtf_style_1h": _p(G_TF, "1h signal style", "choice", "momentum", choices=["momentum", "reversion"]),
+    "mtf_style_4h": _p(G_TF, "4h signal style", "choice", "momentum", choices=["momentum", "reversion"]),
+    "mtf_win": _p(G_TF, "Intraday z-score lookback (bars)", "int", 60, 10, 500, 5,
+                  help="Rolling window, in bars of each timeframe, for the 15m / 1h / 4h z-score signal."),
+
     # Phase 1: market type decides whether a trade is allowed and how big it is. Off = the original strategy.
-    "use_regime": _p(G_REGIME, "Use regime filter", "bool", False,
-                     help="On: every entry is checked against the market type (trend + volatility) first. "
-                          "Off: the original strategy, unchanged."),
     "rg_trend_len": _p(G_REGIME, "Trend average (days)", "int", 200, 50, 300, 10,
                        help="Uptrend = close above this moving average AND the average rising. Downtrend = the opposite. Anything else = mixed."),
     "rg_slope_len": _p(G_REGIME, "Trend slope measured over (days)", "int", 20, 5, 60, 5),
@@ -212,9 +283,6 @@ PARAMS.update({
                             "so macro factors alone cannot open a trade. In the default backtest these trades were not worse, so it is off."),
 
     # Phase 2b: the HMM state (trained in the Regime lab tab) scales or blocks entries. Works with or without Phase 1.
-    "use_hmm_gate": _p(G_HMM, "Use HMM gate", "bool", False,
-                       help="On: entry size is also multiplied by the HMM state multiplier below. Needs 'Train HMM' in the "
-                            "Regime lab tab first. Before the HMM's first training period ends, the gate does nothing."),
     "hmm_weighting": _p(G_HMM, "How the state is read", "choice", "probability", choices=["probability", "most_likely"],
                         help="probability: multiplier = sum of (probability of each state x its multiplier), so it changes smoothly. "
                              "most_likely: use only the most likely state's multiplier."),
@@ -226,6 +294,10 @@ PARAMS.update({
     "hmm_block_neg_er": _p(G_HMM, "Block longs when HMM expected return is below 0", "bool", False,
                            help="Shorts are blocked when it is above 0."),
 })
+
+for _k, _t in TIMEFRAMES.items():
+    PARAMS[f"w_tf_{_k}"] = _p(G_TF, f"Weight: {_t['label']}", "int", _t["weight"], 0, 10, 1,
+                              help="Weighted mode only. 0 = the timeframe is ignored.")
 
 DEFAULT_PARAMS = {k: v["default"] for k, v in PARAMS.items()}
 
@@ -256,6 +328,13 @@ COST_PRESETS = {
     # MCX: brokerage ~Rs 20 an order, CTT 0.01% on sell, exchange + SEBI + stamp duty + 18% GST on brokerage.
     "MCX gold futures (India), approximate": {**_ZERO, "spread": 0.10, "slippage_bps": 1.0, "pct_buy": 0.0050,
                                               "pct_sell": 0.0130, "fixed_per_order": 0.28},
+    # Binance (Live tab markets). Spot fee 0.1% a side (0.075% paying in BNB); spot cannot be shorted.
+    "Binance PAXGUSDT spot (0.1% fee)": {**_ZERO, "spread": 0.05, "slippage_bps": 2.0, "pct_buy": 0.10, "pct_sell": 0.10,
+                                         "lot_size": 1.0},
+    # USDT-M perpetual: taker fee 0.05%. Funding is paid every 8 hours and changes; 0.01% per 8h is about 11% a year.
+    "Binance XAUUSDT perpetual (0.05% taker)": {**_ZERO, "spread": 0.05, "slippage_bps": 1.0, "pct_buy": 0.05,
+                                                "pct_sell": 0.05, "lot_size": 1.0, "financing_long_pct": 10.95,
+                                                "financing_short_pct": -10.95},
     "No charges (gross)": dict(_ZERO),
 }
 DEFAULT_COST_PRESET = "XAUUSD CFD, raw spread + commission"

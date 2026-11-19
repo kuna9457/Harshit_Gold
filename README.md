@@ -237,3 +237,70 @@ half only is probably fitted to that half.
 | `gold_bot/regime_hmm.py` | Phase 2a HMM: features, walk-forward training, forward filter, HMM-only signal, state summary |
 | `gold_bot/engine.py` | The backtest: fills, stops, sizing, both gates, charges, metrics, sweeps |
 | `REGIME_PLAN.md` | Phase plan and results |
+
+## Volume filter (RVOL z-score spike + volume dry-up)
+
+Logic: `VOLUME_SIGNALS_LOGIC.md`. Code: `gold_bot/features.py` (`add_volume`), gate in `gold_bot/engine.py`.
+Sidebar: tick boxes in **Include in backtest**, settings in **Volume filter**. Backtest tab: **Run volume filter comparison**.
+
+* Volume series: GLD ETF volume by default (no futures roll effect, from Nov 2004); GC=F volume optional.
+* **RVOL spike**: volume z-score vs the previous 20 days >= 2.5. `block_against` (default) skips a long if a spike day in the
+  last 3 bars closed down (a short if it closed up). `confirm` instead requires a spike in the trade's direction.
+* **VDU**: volume below the 10th percentile of the previous 50 days inside a tight base (10-day range <= 2.5 x ATR 20).
+  Longs need a dry-up within the last 20 bars.
+* The filter only removes entries; exits are unchanged. Before volume history exists it does nothing.
+
+Backtest, 2005 onwards, CFD charges, all other settings default:
+
+| | CAGR | Max DD | Profit factor | Trades |
+|---|---|---|---|---|
+| No volume filter | 5.61% | -19.6% | 1.48 | 197 |
+| RVOL block_against | 5.58% | -18.9% | 1.54 | 175 |
+| VDU only | 1.46% | -21.0% | 1.46 | 61 |
+| No volume filter, regime filter ON | 6.05% | -14.3% | 1.94 | 173 |
+| RVOL block_against, regime filter ON | 6.11% | -13.8% | 2.10 | 152 |
+
+RVOL `block_against` gives fewer, better trades in both halves of the period at about the same CAGR. VDU and RVOL `confirm`
+remove most trades and cut CAGR to 1-2%.
+
+## Multi-timeframe bot and Live (paper) trading on Binance
+
+Plan and design: `MULTI_TIMEFRAME_PLAN.md`. Code: `gold_bot/binance.py` (data + live price), `gold_bot/mtf.py`
+(timeframes, combiner, walk-forward training), `gold_bot/live.py` (paper sessions, saved strategies), `live_runner.py`.
+
+* **Data:** Binance 15m klines, cached in `data/binance/` (first download ~5 minutes). PAXGUSDT spot from Aug 2020,
+  XAUUSDT perpetual from Dec 2025. 1h / 4h / 1d are built from the 15m bars. The daily layer uses the existing daily data.
+* **Tick boxes** (sidebar, "Include in backtest"): timeframes 15m / 1h / 4h / Daily, factors, volume filters, regime
+  rules, HMM gate. The fastest ticked timeframe is the one the bot trades on.
+* **No look-ahead:** a 1h / 4h bar is used only after it closes; a daily bar dated D from 00:00 UTC on D+1.
+* **Multi-timeframe tab:** backtest, "does each timeframe add value", walk-forward training, save as a strategy.
+* **Live (paper) tab:** pick a strategy and market, press Start. Every refresh re-runs the same engine from the start
+  time to the last closed bar. `python live_runner.py` does the same in a terminal and logs to `data/live/events.csv`.
+  Nothing is sent to Binance. Binance blocks US-hosted servers (HTTP 451), so deploy outside the US.
+
+PAXGUSDT, 2021-09 to 2026-11, Binance spot charges (0.1% a side), default settings. Buy and hold: 16.1% a year.
+
+| Ticked timeframes | CAGR net | CAGR gross | Max DD | Trades |
+|---|---|---|---|---|
+| 15m + 1h + 4h + 1d (all) | -73.9% | -7.4% | -99.9% | 1341 |
+| 1h + 4h + 1d | -28.0% | 3.7% | -81.9% | 388 |
+| 4h + 1d (VDU off) | -3.5% | 19.3% | -38.0% | 248 |
+| 1d only (VDU off) | 6.8% | 9.2% | -14.2% | 53 |
+
+The default intraday signal (z-score momentum) loses before charges on 15m and 1h; flipped (mean reversion) it makes a
+small gross profit on 15m that charges remove. 4h + 1d beats buy and hold before charges, but 0.1% spot fees wipe it out.
+
+## Live tick-by-tick feed
+
+Code: `gold_bot/ticks.py` (websocket), `gold_bot/live.py` (`with_forming`). Read-only market data, no API key.
+
+* Streams best bid / ask (`bookTicker`) and trades (`aggTrade`) for PAXGUSDT (spot) or XAUUSDT (perpetual) in a background
+  thread; it reconnects by itself. The live price is the mid of bid and ask. Spot gold trades only every few seconds, so
+  the trade tape is sparse while quotes update many times a second.
+* The 15m bar in progress is built from the ticks (open seeded from REST) and added as the last row of the trading
+  timeframe. Orders decided on the last closed bar fill at the real open of the new bar, and stops / targets are checked
+  on the live high / low. The new row has no score, so a half-built bar never opens a trade.
+* Signals are rebuilt only when a new 15m bar closes, so the tick panel refreshes every second and the strategy panel
+  every 2-120 seconds. If the websocket is down it falls back to the REST price and closed bars only.
+* "Record ticks to disk" (Live tab, or `python live_runner.py --record`) saves trades and 1-second quote snapshots to
+  `data/ticks/<symbol>_<date>.csv`.

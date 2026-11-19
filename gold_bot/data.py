@@ -164,6 +164,8 @@ def load_all(refresh=False):
     add("sofr", lambda: _cached("nyfed_sofr", lambda: _nyfed("secured", "sofr"), refresh)["value"])
     # CPI changes once a month and the BLS open API allows 25 calls a day, so refresh it weekly at most.
     add("cpi", lambda: _cached("bls_cpi", _bls_cpi, False, 24 * 7)["value"])
+    # Volume filter: GLD shares traded (no futures roll effect).
+    add("gld_volume", lambda: yahoo("GLD", refresh)["Volume"].replace(0, np.nan).dropna())
 
     def etf_flow(name, symbols):
         user = _override(name)
