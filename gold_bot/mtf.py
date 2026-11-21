@@ -22,7 +22,13 @@ def ticked(p):
     return sorted(tfs, key=lambda k: TIMEFRAMES[k]["minutes"])
 
 
-def bars_per_year(tf):
+def bars_per_year(tf, feat=None):
+    """Bars a year, for annualising Sharpe / volatility. Measured from the data when given (gold futures trade about 252
+    days a year, Binance gold 365); otherwise the 24/7 figure for the timeframe."""
+    if feat is not None and len(feat) > 1:
+        years = (feat.index[-1] - feat.index[0]).days / 365.25
+        if years > 0:
+            return len(feat) / years
     return MIN_PER_YEAR / TIMEFRAMES[tf]["minutes"]
 
 
@@ -69,8 +75,15 @@ def daily_layer(gold, raw, p, hmm=None):
 
 def build(bars15, gold, raw, params=None, hmm=None):
     """Trading-timeframe frame with OHLCV, ATR, sig_<tf> for every ticked timeframe and the combined `score`,
-    plus the regime and volume columns the engine reads. Returns (frame, trading timeframe)."""
+    plus the regime and volume columns the engine reads. Returns (frame, trading timeframe).
+
+    bars15=None is the long-history mode: the downloaded daily gold futures data (back to 2000) is the trading series and
+    only the Daily layer exists, so it is the same strategy as the Backtest tab. Intraday timeframes need Binance bars."""
     p = {**DEFAULT_PARAMS, **(params or {})}
+    if bars15 is None:
+        feat = daily_layer(gold, raw, p, hmm)
+        feat["sig_1d"] = feat["score"]
+        return feat, "1d"
     tfs = ticked(p)
     if not tfs:
         raise ValueError("No timeframe is ticked. Tick at least one in 'Include in backtest'.")
@@ -129,7 +142,7 @@ def run(bars15, gold, raw, params=None, costs=None, capital=100_000, start=None,
         feat, base_tf = build(bars15, gold, raw, p, hmm)
     p_run = {**p, "use_hmm_gate": p["use_hmm_gate"] and "hmm_mult" in feat}
     res = engine.run_backtest(None, None, p_run, costs, capital, start, end, rf, feat=feat,
-                              ppy=bars_per_year(base_tf), **kw)
+                              ppy=bars_per_year(base_tf, feat), **kw)
     res["base_tf"] = base_tf
     return res
 
@@ -233,7 +246,7 @@ def walk_forward(bars15, gold, raw, params, ranges, n_sets=30, train_days=365, t
     gold_px = feat0["Close"].reindex(eq_tuned.index)
     curves = pd.DataFrame({"Walk-forward (tuned, out of sample)": eq_tuned, "Sidebar settings (no tuning)": eq_base.reindex(eq_tuned.index),
                            "Buy and hold gold": capital * gold_px / gold_px.iloc[0]})
-    ppy = bars_per_year(base_tf)
+    ppy = bars_per_year(base_tf, feat0)
     table = pd.DataFrame({n: engine.metrics(curves[n].dropna(), rf, ppy) for n in curves})
     all_trades = pd.concat(trades, ignore_index=True) if trades else pd.DataFrame()
     last = train_score[:, -1]

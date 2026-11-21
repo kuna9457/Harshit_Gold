@@ -196,5 +196,9 @@ def get_stream(symbol):
     with _REG:
         s = _STREAMS.get(symbol)
         if s is None or not s._thread.is_alive():
-            s = _STREAMS[symbol] = TickStream(symbol)
+            if symbol.startswith("MT5:"):
+                from . import mt5
+                s = _STREAMS[symbol] = mt5.MT5Stream(symbol)
+            else:
+                s = _STREAMS[symbol] = TickStream(symbol)
         return s

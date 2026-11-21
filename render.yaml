@@ -9,3 +9,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: MONGODB_URI   # paste your MongoDB Atlas connection string in the Render dashboard; without it settings live on the temporary disk
+        sync: false

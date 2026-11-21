@@ -304,3 +304,29 @@ Code: `gold_bot/ticks.py` (websocket), `gold_bot/live.py` (`with_forming`). Read
   every 2-120 seconds. If the websocket is down it falls back to the REST price and closed bars only.
 * "Record ticks to disk" (Live tab, or `python live_runner.py --record`) saves trades and 1-second quote snapshots to
   `data/ticks/<symbol>_<date>.csv`.
+
+## Saving settings, and where data is kept
+
+* **Save settings** (sidebar, top of "Strategy parameters") stores every setting: parameters, tick boxes, charges, capital.
+  They load again whenever the app starts. The caption under the button shows "Unsaved changes" when the sidebar differs
+  from what is saved. "Reset parameters to defaults" only resets the current session; press Save to overwrite what is stored.
+* **Storage** (`gold_bot/store.py`): plain files under `data/` by default (`settings.json`, `strategies/`, `live/session.json`,
+  `live/events.csv`). Set the environment variable `MONGODB_URI` (and optionally `MONGODB_DB`, default `gold_bot`) and the same
+  data is kept in MongoDB instead. On Render's free plan the disk is wiped on every restart or redeploy, so files do not
+  survive there; use MongoDB (a free Atlas cluster is enough) or a paid persistent disk.
+
+## Longer backtests
+
+* **Multi-timeframe tab -> Data** has three sources: PAXGUSDT (intraday, Aug 2020 onward, the longest Binance has), XAUUSDT
+  perpetual (Dec 2025 onward, about 11 months) and **Gold futures daily** (the downloaded GC=F data, back to 2000, Daily
+  timeframe only). The daily source runs the same code and engine as the Backtest tab and also supports walk-forward training.
+* Intraday history before Aug 2020 is not freely available in bulk (Dukascopy's feed was tried: rate limited and 6-19 s a file).
+
+## XAUUSD from MetaTrader 5 (local Windows PC only)
+
+The **MT5 (XAUUSD)** tab connects to your broker through the MetaTrader 5 terminal installed on the same PC (login, password and server, or the account the terminal is already logged in to; the password is never saved). It never places orders.
+
+- **History:** download years of 15m bars (converted from broker time to UTC, tick volume) into `data/mt5/`. It then appears as a "Data" choice in the Multi-timeframe tab and as a "Live market" in the Live tab.
+- **Live:** quotes are read tick by tick from the terminal, so the Live paper session works the same as on Binance.
+- **Chart signals:** press *Install indicator* (copies and compiles `mt5/GoldBotSignals.mq5`), drag **GoldBotSignals** onto a gold chart in MT5. The Live tab (toggle) and the "Draw these trades on the MT5 chart" button under a backtest write `gold_bot_signals.csv` to MT5's common Files folder; the indicator draws buy / sell arrows, exits, entry-to-exit lines (green win, red loss, yellow open) and the stop and target of an open trade.
+- Does not work on Render (no MT5 terminal there). Run the app locally for MT5.

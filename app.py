@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from gold_bot import binance, data, engine, features, live, mtf, ticks
+from gold_bot import binance, data, engine, features, live, mt5, mtf, store, ticks
 from gold_bot import regime_hmm as hmm
 from gold_bot.config import (CATEGORY_ORDER, COST_FIELDS, COST_PRESETS, DATA_INPUTS, DEFAULT_COST_PRESET,
                              DEFAULT_PARAMS, FACTORS, GROUP_ORDER, PARAMS, TIMEFRAMES)
@@ -43,7 +43,19 @@ def load(refresh_id):
 
 @st.cache_data(show_spinner="Loading Binance 15m gold bars (the first download takes a few minutes)...", ttl=900)
 def load_bars(symbol, refresh_id):
-    return binance.klines(symbol)
+    return mt5.klines(symbol, update=False) if mt5.is_mt5(symbol) else binance.klines(symbol)
+
+
+def mt5_markets():
+    """MT5 symbols that can be used as a data source: the one in use now, plus any history already downloaded."""
+    names = ([mt5.STATE["symbol"]] if mt5.STATE["connected"] and mt5.STATE["symbol"] else []) + mt5.cached_symbols()
+    return [mt5.PREFIX + n for n in dict.fromkeys(names)]
+
+
+def market_label(k):
+    if mt5.is_mt5(k):
+        return f"{mt5.name_of(k)} from MetaTrader 5 (broker XAUUSD, tick volume)"
+    return binance.MARKETS[k]["label"] if k in binance.MARKETS else k
 
 
 # ---------------------------------------------------------
@@ -51,11 +63,53 @@ def load_bars(symbol, refresh_id):
 # ---------------------------------------------------------
 ss = st.session_state
 ss.setdefault("refresh_id", 0)
+
+
+def _cast(name, v):
+    """A saved value in the type the widget expects (JSON turns 1.0 into 1 and so on)."""
+    d = DEFAULT_PARAMS[name]
+    return bool(v) if isinstance(d, bool) else (v if isinstance(d, str) or PARAMS[name]["kind"] == "choice" else type(d)(v))
+
+
+if "settings_loaded" not in ss:
+    # first run of this browser session: start from the settings saved with the Save button, if there are any
+    saved = store.load_settings() or {}
+    ss["saved_info"] = saved.get("saved")
+    for k, v in (saved.get("params") or {}).items():
+        if k in DEFAULT_PARAMS:
+            try:
+                ss[f"p_{k}"] = _cast(k, v)
+            except (TypeError, ValueError):
+                pass
+    if saved.get("cost_preset") in COST_PRESETS:
+        ss["cost_preset"] = saved["cost_preset"]
+    for k, v in (saved.get("costs") or {}).items():
+        if k in COST_FIELDS:
+            ss[f"c_{k}"] = float(v)
+    ss["capital"] = int(saved.get("capital", 100_000))
+    ss["rf_pct"] = float(saved.get("rf_pct", 4.0))
+    ss["settings_loaded"] = True
 for k, v in DEFAULT_PARAMS.items():
     ss.setdefault(f"p_{k}", v)
 ss.setdefault("cost_preset", DEFAULT_COST_PRESET)
-for k, v in COST_PRESETS[DEFAULT_COST_PRESET].items():
+for k, v in COST_PRESETS[ss["cost_preset"]].items():
     ss.setdefault(f"c_{k}", float(v))
+ss.setdefault("capital", 100_000)
+ss.setdefault("rf_pct", 4.0)
+
+
+def current_settings():
+    return dict(params={k: ss[f"p_{k}"] for k in PARAMS}, cost_preset=ss["cost_preset"],
+                costs={k: ss[f"c_{k}"] for k in COST_FIELDS}, capital=ss["capital"], rf_pct=ss["rf_pct"])
+
+
+def save_settings():
+    store.save_settings(current_settings())
+    ss["saved_info"] = "just now"
+    ss["saved_snapshot"] = repr(current_settings())
+
+
+ss.setdefault("saved_snapshot", repr(current_settings()) if ss.get("saved_info") else None)
 
 
 def reset_params():
@@ -125,8 +179,8 @@ with st.sidebar:
     st.header("Backtest setup")
     first, last = gold.index[0].date(), gold.index[-1].date()
     start, end = st.slider("Test period", first, last, (first, last), format="YYYY-MM-DD")
-    capital = st.number_input("Initial capital (USD)", 1_000, 100_000_000, 100_000, step=10_000)
-    rf = st.number_input("Risk-free rate for Sharpe (% a year)", 0.0, 15.0, 4.0, step=0.25) / 100
+    capital = st.number_input("Initial capital (USD)", 1_000, 100_000_000, step=10_000, key="capital")
+    rf = st.number_input("Risk-free rate for Sharpe (% a year)", 0.0, 15.0, step=0.25, key="rf_pct") / 100
 
     with st.expander("Charges and brokerage", expanded=False):
         st.selectbox("Preset", list(COST_PRESETS), key="cost_preset", on_change=apply_preset)
@@ -135,6 +189,17 @@ with st.sidebar:
         st.caption("Presets are typical retail levels. Replace them with the numbers on your broker's contract note.")
 
     st.header("Strategy parameters")
+    st.button("Save settings", type="primary", on_click=save_settings, key="save_settings_btn",
+              help="Saves every setting in this sidebar (parameters, ticks, charges, capital). They are loaded again whenever the app "
+                   "starts. Without this they reset each time the server restarts.")
+    if ss.get("saved_snapshot") is None:
+        st.caption("Nothing saved yet: settings reset when the app restarts.")
+    elif ss["saved_snapshot"] != repr(current_settings()):
+        st.caption(f"Unsaved changes (last saved: {ss.get('saved_info')}). Press Save settings to keep them.")
+    else:
+        st.caption(f"Saved ({ss.get('saved_info')}) in {store.store.name}.")
+    if store.error:
+        st.warning(store.error)
     for group in GROUP_ORDER:
         with st.expander(group, expanded=group in GROUP_ORDER[:2]):
             for name, spec in PARAMS.items():
@@ -150,8 +215,8 @@ costs = {k: ss[f"c_{k}"] for k in COST_FIELDS}
 run_kw = dict(costs=costs, capital=capital, start=str(start), end=str(end), rf=rf, hmm=ss.get("hmm"))
 
 st.title("Gold (XAUUSD) macro strategy backtester")
-tab_data, tab_bt, tab_regime, tab_sweep, tab_mtf, tab_live = st.tabs(
-    ["Data and parameters", "Backtest", "Regime lab (rules vs HMM)", "Parameter sweep", "Multi-timeframe (Binance)", "Live (paper)"])
+tab_data, tab_bt, tab_regime, tab_sweep, tab_mtf, tab_mt5, tab_live = st.tabs(
+    ["Data and parameters", "Backtest", "Regime lab (rules vs HMM)", "Parameter sweep", "Multi-timeframe", "MT5 (XAUUSD)", "Live (paper)"])
 
 # ---------------------------------------------------------
 # Tab 1: what goes in, how often it changes, what can be tweaked
@@ -726,6 +791,9 @@ with tab_sweep:
 # Tab 5: multi-timeframe backtest and walk-forward training on Binance bars
 # ---------------------------------------------------------
 TF_COLOURS = {"15m": ORANGE, "1h": AQUA, "4h": BLUE, "1d": RED}
+GOLD_DAILY = "gold_daily"  # long-history source: the downloaded daily gold futures data (back to 2000), Daily layer only
+SOURCE_LABEL = {**{k: v["label"] for k, v in binance.MARKETS.items()},
+                GOLD_DAILY: "Gold futures daily, GC=F (back to 2000, Daily timeframe only)"}
 WF, SB = "Walk-forward (tuned, out of sample)", "Sidebar settings (no tuning)"
 
 
@@ -763,23 +831,35 @@ with tab_mtf:
                "ticked one times the entry. Tick timeframes in the sidebar under 'Include in backtest'; settings under 'Timeframes'. "
                "Every other sidebar setting (stops, sizing, volume / regime filters, charges) applies here too. Plan: MULTI_TIMEFRAME_PLAN.md.")
     a, b = st.columns([2, 3])
-    mtf_symbol = a.selectbox("Market", list(binance.MARKETS), format_func=lambda k: binance.MARKETS[k]["label"], key="mtf_symbol",
-                             help="PAXGUSDT has history from Aug 2020 (best for training). XAUUSDT perpetual only from Dec 2025.")
+    mtf_symbol = a.selectbox("Data", list(SOURCE_LABEL) + mt5_markets(), format_func=lambda k: SOURCE_LABEL.get(k) or market_label(k),
+                             key="mtf_symbol",
+                             help="PAXGUSDT: intraday from Aug 2020 (the longest Binance has). XAUUSDT perpetual: only from Dec 2025, "
+                                  "about 11 months, so results on it say little. Gold futures daily: 26 years, but only the Daily "
+                                  "timeframe exists. Use it to check that settings found on a short intraday window also hold up over decades.")
+    daily_only = mtf_symbol == GOLD_DAILY
     b.markdown("&nbsp;")
-    b.markdown(tf_summary(params))
-    if not ss["cost_preset"].startswith("Binance"):
-        st.info("Charges come from the sidebar. For Binance pick a 'Binance ...' preset under 'Charges and brokerage'. "
-                "Intraday trades chase small moves, so charges decide most results here.")
-    try:
-        bars = load_bars(mtf_symbol, ss["refresh_id"])
-    except Exception as e:
-        bars = None
-        st.error(f"Could not load Binance data: {e}")
-    if bars is not None and not mtf.ticked(params):
+    b.markdown("trades on **daily** bars, the same strategy as the Backtest tab (timeframe ticks do not apply)" if daily_only else tf_summary(params))
+    if daily_only:
+        st.info("Long-history mode: the downloaded daily gold futures data, 26 years. Pick a charges preset such as 'XAUUSD CFD ...' "
+                "in the sidebar, since Binance fees do not apply to this data.")
+    elif not ss["cost_preset"].startswith("Binance") or mt5.is_mt5(mtf_symbol):
+        if not mt5.is_mt5(mtf_symbol):
+            st.info("Charges come from the sidebar. For Binance pick a 'Binance ...' preset under 'Charges and brokerage'. "
+                    "Intraday trades chase small moves, so charges decide most results here.")
+        else:
+            st.info("MT5 data: pick an 'XAUUSD CFD ...' charges preset in the sidebar (spread, commission and swap of your broker).")
+    bars = None
+    if not daily_only:
+        try:
+            bars = load_bars(mtf_symbol, ss["refresh_id"])
+        except Exception as e:
+            st.error(f"Could not load Binance data: {e}")
+    if not daily_only and bars is not None and not mtf.ticked(params):
         st.error("No timeframe is ticked. Tick at least one under 'Include in backtest'.")
-    if bars is not None and mtf.ticked(params):
-        bfirst, blast = bars.index[0].date(), bars.index[-1].date()
-        mstart, mend = st.slider("Test period (Binance data)", bfirst, blast, (bfirst, blast), format="YYYY-MM-DD", key="mtf_period")
+    if daily_only or (bars is not None and mtf.ticked(params)):
+        idx_ = gold.index if daily_only else bars.index
+        bfirst, blast = idx_[0].date(), idx_[-1].date()
+        mstart, mend = st.slider("Test period", bfirst, blast, (bfirst, blast), format="YYYY-MM-DD", key=f"mtf_period_{mtf_symbol}")
         hmm_obj = ss.get("hmm") if params["use_hmm_gate"] else None
         if params["use_hmm_gate"] and hmm_obj is None:
             st.warning("'HMM gate' is ticked but no HMM is trained yet, so it does nothing. Train it in the Regime lab tab.")
@@ -792,7 +872,7 @@ with tab_mtf:
                     ss["mtf_inputs"] = mtf_inputs
                 except ValueError as e:
                     st.error(str(e))
-        if c2.button("Does each timeframe add value?", help="Runs: all ticked, each one removed, and each one alone."):
+        if c2.button("Does each timeframe add value?", help="Runs: all ticked, each one removed, and each one alone.", disabled=daily_only):
             tfs = mtf.ticked(params)
             runs = {"All ticked": params}
             for tf in tfs if len(tfs) > 1 else []:
@@ -846,6 +926,17 @@ with tab_mtf:
                 st.dataframe(pd.DataFrame({"Value": [f"{x[k]:,.2f}" if isinstance(x[k], float) else f"{x[k]:,}" for k in order]}, index=order),
                              width="stretch")
 
+            if mt5.STATE["connected"] and not trades.empty:
+                tgt = mt5.name_of(mtf_symbol) if mt5.is_mt5(mtf_symbol) else (mt5.STATE["symbol"] or "")
+                if tgt and st.button(f"Draw these {len(trades)} trades on the MT5 {tgt} chart",
+                                     help="Writes the entries, exits and lines to MT5; the GoldBotSignals indicator on the chart draws them. "
+                                          "Set up the indicator in the MT5 tab first."):
+                    try:
+                        path_, n_ = mt5.write_chart_file(tgt, mt5.chart_rows(tgt, trades), title="backtest")
+                        st.success(f"{n_} rows sent to MT5 ({path_.name}). Open the {tgt} chart; scroll back to the trade dates.")
+                    except Exception as e:
+                        st.error(f"Could not write the chart file: {e}")
+
             days = st.select_slider("Show the last", [3, 7, 14, 30, 90], value=14, format_func=lambda d: f"{d} days", key="mtf_days")
             w = f[f.index >= f.index[-1] - pd.Timedelta(days=days)]
             fig = go.Figure(go.Candlestick(x=w.index, open=w["Open"], high=w["High"], low=w["Low"], close=w["Close"], name="Price",
@@ -869,8 +960,9 @@ with tab_mtf:
 
             l, rr = st.columns(2)
             with l:
-                st.markdown("**Trades by hour of entry (UTC)**")
-                trades_by(trades, lambda t: t["entry_date"].dt.hour, "Hour (UTC)")
+                if not daily_only:
+                    st.markdown("**Trades by hour of entry (UTC)**")
+                    trades_by(trades, lambda t: t["entry_date"].dt.hour, "Hour (UTC)")
             with rr:
                 st.markdown("**Trades by year**")
                 trades_by(trades, lambda t: t["entry_date"].dt.year, "Year")
@@ -899,13 +991,14 @@ with tab_mtf:
             ranges[k] = (lo, hi, step, s_["kind"])
         a, b, c3, d, e, g = st.columns(6)
         n_sets = a.number_input("Parameter sets to try", 5, 500, 20, step=5, key="wf_n")
-        train_days = b.number_input("Training window (days)", 60, 1500, 365, step=30, key="wf_train")
-        test_days = c3.number_input("Test window (days)", 14, 365, 90, step=14, key="wf_test")
+        train_days = b.number_input("Training window (days)", 60, 9000, 1095 if daily_only else 365, step=30, key=f"wf_train_{mtf_symbol}")
+        test_days = c3.number_input("Test window (days)", 14, 1500, 365 if daily_only else 90, step=14, key=f"wf_test_{mtf_symbol}")
         score_by = d.selectbox("Pick the winner by", list(mtf.SCORERS), key="wf_score")
         min_tr = e.number_input("Min trades in training", 0, 500, 10, key="wf_min")
         seed = g.number_input("Random seed", 0, 9999, 0, key="wf_seed")
-        per_set = {"15m": 12, "1h": 3, "4h": 1, "1d": 0.5}[mtf.ticked(params)[0]]
-        st.caption(f"Rough time: about {max(1, round(per_set * (n_sets + 1) / 60))} minute(s) on {mtf.ticked(params)[0]} bars "
+        base_now = "1d" if daily_only else mtf.ticked(params)[0]
+        per_set = {"15m": 12, "1h": 3, "4h": 1, "1d": 0.5}[base_now]
+        st.caption(f"Rough time: about {max(1, round(per_set * (n_sets + 1) / 60))} minute(s) on {base_now} bars "
                    "(each parameter set rebuilds the signals on the full history).")
         if st.button("Train (walk-forward)", type="primary", disabled=not ranges, key="wf_go"):
             bar = st.progress(0.0, text="Training...")
@@ -951,7 +1044,120 @@ with tab_mtf:
         save_strategy_box(params, "mtf")
 
 # ---------------------------------------------------------
-# Tab 6: live paper trading on the Binance feed
+# Tab 6: MetaTrader 5 (XAUUSD): connect, history, and drawing the bot's trades on the MT5 chart
+# ---------------------------------------------------------
+with tab_mt5:
+    st.caption("Use your broker's XAUUSD from the MetaTrader 5 terminal installed on this PC. Read only: the app reads prices and history and "
+               "draws on the chart, and never places an order. The password is kept in memory only, not saved anywhere.")
+    if not mt5.available():
+        st.error("The MetaTrader5 Python package is not installed. Run:  pip install MetaTrader5")
+    else:
+        sc = mt5.saved_connection()
+        with st.expander("Connection", expanded=not mt5.STATE["connected"]):
+            c1, c2, c3 = st.columns(3)
+            m_login_txt = c1.text_input("Login (account number)", str(sc.get("login", "") or ""), key="mt5_login",
+                                        help="Leave empty (with the password empty) to use the account the MT5 terminal is already logged in to.")
+            m_login = int(m_login_txt) if m_login_txt.strip().isdigit() else 0
+            if m_login_txt.strip() and not m_login_txt.strip().isdigit():
+                c1.error("The login is digits only.")
+            m_pass = c2.text_input("Password", type="password", key="mt5_pass")
+            m_server = c3.text_input("Server", sc.get("server", ""), key="mt5_server", help="Exactly as in MT5, for example  ICMarkets-Demo.")
+            m_path = st.text_input("Terminal path (optional)", sc.get("path", ""), key="mt5_path",
+                                   placeholder=r"C:\Program Files\MetaTrader 5\terminal64.exe",
+                                   help="Only needed if you have several MT5 terminals installed.")
+            b1, b2, _ = st.columns([1, 1, 4])
+            if b1.button("Connect", type="primary", key="mt5_connect"):
+                with st.spinner("Connecting to MT5 (this starts the terminal if it is closed)..."):
+                    ok = mt5.connect(m_login, m_pass, m_server, m_path)
+                if ok:
+                    st.rerun()
+            if b2.button("Disconnect", key="mt5_disconnect", disabled=not mt5.STATE["connected"]):
+                mt5.disconnect()
+                st.rerun()
+        if mt5.STATE["error"] and not mt5.STATE["connected"]:
+            st.error(mt5.STATE["error"])
+        inf = mt5.info() if mt5.STATE["connected"] else None
+        if inf is None:
+            st.info("Not connected. Enter your broker login, password and server (a demo account is fine), then press Connect.")
+        else:
+            a_, t_ = inf["account"], inf["terminal"]
+            kind = "DEMO account" if inf["demo"] else "REAL account"
+            (st.success if inf["demo"] else st.warning)(f"Connected to {a_['server']} as {a_['name']} ({a_['login']}), {kind}. "
+                                                         f"Nothing is traded by this app.")
+            c = st.columns(5)
+            c[0].metric("Balance", f"{a_['balance']:,.2f} {a_['currency']}")
+            c[1].metric("Equity", f"{a_['equity']:,.2f}")
+            c[2].metric("Leverage", f"1:{a_['leverage']}")
+            c[3].metric("Terminal build", f"{t_['build']}")
+            c[4].metric("Terminal link", "online" if t_["connected"] else "OFFLINE")
+
+            syms = mt5.find_symbols()
+            if not syms:
+                st.error("No gold symbol found. In MT5 open Market Watch, right click, Symbols, search 'XAU' and show it.")
+            else:
+                pick = st.selectbox("Gold symbol at your broker", syms, key="mt5_symbol",
+                                    help="Names differ by broker (XAUUSD, GOLD, XAUUSDm ...). Pick the plain spot gold one.")
+                try:
+                    si = mt5.select_symbol(pick)
+                    q = mt5.live_price(mt5.PREFIX + pick)
+                    spread_usd = q["ask"] - q["bid"]
+                    c = st.columns(5)
+                    c[0].metric("Bid", f"{q['bid']:,.{si['digits']}f}")
+                    c[1].metric("Ask", f"{q['ask']:,.{si['digits']}f}", f"spread {spread_usd:.2f} USD", delta_color="off")
+                    c[2].metric("Contract size", f"{si['trade_contract_size']:g} oz / lot", f"min lot {si['volume_min']:g}", delta_color="off")
+                    c[3].metric("Swap long / short", f"{si['swap_long']:g} / {si['swap_short']:g}", "per lot per night, in broker units", delta_color="off")
+                    c[4].metric("Server clock", f"UTC{mt5.server_offset_hours(pick):+g}",
+                                "bars are converted to UTC", delta_color="off")
+                    st.caption("Put your broker's spread, swap and commission into the sidebar charges (preset 'XAUUSD CFD ...'). "
+                               "A closed market (weekend) shows the last quote.")
+                except Exception as e:
+                    st.error(f"Could not read {pick}: {e}")
+                    pick = None
+
+                if pick:
+                    st.subheader("History for backtests and training")
+                    cached = mt5.STORE / f"{pick}_15m.csv"
+                    h1, h2 = st.columns([1, 2])
+                    yrs = h1.number_input("Years to download", 1, 20, 10, key="mt5_years",
+                                          help="Brokers keep a limited history. You get what the server has, often 5 to 10 years of 15m bars.")
+                    if h2.button(f"Download / update {pick} 15m history", key="mt5_dl"):
+                        with st.spinner("Downloading from MT5..."):
+                            try:
+                                mt5.klines(mt5.PREFIX + pick, update=True, years=int(yrs))
+                                load_bars.clear()
+                                st.success("Done.")
+                            except Exception as e:
+                                st.error(f"Download failed: {e}")
+                    if cached.exists():
+                        hb = mt5.klines(mt5.PREFIX + pick, update=False)
+                        st.caption(f"Stored: {len(hb):,} bars from {hb.index[0]:%Y-%m-%d} to {hb.index[-1]:%Y-%m-%d %H:%M} UTC "
+                                   f"({(hb.index[-1] - hb.index[0]).days / 365.25:.1f} years). Choose it in the Multi-timeframe tab under 'Data', "
+                                   f"and as the 'Live market' in the Live tab. Volume is MT5 tick volume (number of quotes), not traded lots.")
+                    else:
+                        st.caption("No history stored yet.")
+
+                    st.subheader("Signals on the MT5 chart")
+                    st.markdown(
+                        "1. Press **Install indicator** (copies and compiles `GoldBotSignals` into your terminal).  \n"
+                        f"2. In MT5 open a **{pick}** chart (any timeframe), then Navigator, Indicators, **GoldBotSignals**, drag it onto the chart.  \n"
+                        "3. In the **Live** tab keep 'Draw signals on the MT5 chart' on, or press the draw button under a Multi-timeframe backtest. "
+                        "The chart shows buy / sell arrows, an x where each trade exits, a line from entry to exit (green win, red loss, "
+                        "yellow open) and the stop and target of an open trade.")
+                    i1, i2 = st.columns([1, 2])
+                    if i1.button("Install indicator", key="mt5_install"):
+                        with st.spinner("Copying and compiling..."):
+                            ok_, msg_ = mt5.install_indicator()
+                        (st.success if ok_ else st.warning)(msg_)
+                    if i2.button("Draw a test marker on the chart", key="mt5_test",
+                                 help="Puts a buy arrow at the current price and a sell arrow 1 hour ago, to check the indicator is working."):
+                        now_ = pd.Timestamp.now(tz="UTC").tz_localize(None)
+                        rows_ = mt5.chart_rows(pick, pd.DataFrame(), signals=[(now_ - pd.Timedelta(hours=1), q["ask"], "SELL", "test sell"),
+                                                                              (now_, q["bid"], "BUY", "test buy")])
+                        path_, n_ = mt5.write_chart_file(pick, rows_, title="test")
+                        st.success(f"Wrote {n_} rows to {path_}. The chart should update within 2 seconds.")
+
+# ---------------------------------------------------------
+# Tab 7: live paper trading (Binance or MT5 feed)
 # ---------------------------------------------------------
 with tab_live:
     st.caption("Paper trading on the live Binance gold feed. Nothing is sent to the exchange. The session is the same backtest "
@@ -964,12 +1170,17 @@ with tab_live:
         a, b = st.columns(2)
         pick = a.selectbox("Strategy", [CURRENT] + live.list_strategies(), key="live_pick",
                            help="Save strategies in the Multi-timeframe tab (or below).")
-        sym = b.selectbox("Live market", list(binance.MARKETS), format_func=lambda k: binance.MARKETS[k]["label"], key="live_symbol")
+        sym = b.selectbox("Live market", mt5_markets() + list(binance.MARKETS), format_func=market_label, key="live_symbol",
+                          help="XAUUSD from MetaTrader 5 needs the terminal running on this PC (connect in the MT5 tab). "
+                               "Binance works anywhere except US servers.")
+        if mt5.is_mt5(sym) and not mt5.STATE["connected"]:
+            st.warning("MT5 is not connected. Connect in the MT5 tab first, or the session will have no price.")
         p_sel = params if pick == CURRENT else live.load_strategy(pick)
         c1, c2 = st.columns(2)
-        lcap = c1.number_input("Paper capital (USDT)", 100, 10_000_000, 10_000, step=1_000, key="live_cap")
+        lcap = c1.number_input("Paper capital (USD)" if mt5.is_mt5(sym) else "Paper capital (USDT)", 100, 10_000_000, 10_000, step=1_000, key="live_cap")
         presets = list(COST_PRESETS)
-        default = "Binance PAXGUSDT spot (0.1% fee)" if sym == "PAXGUSDT" else "Binance XAUUSDT perpetual (0.05% taker)"
+        default = ("XAUUSD CFD, spread only" if mt5.is_mt5(sym) else
+                   "Binance PAXGUSDT spot (0.1% fee)" if sym == "PAXGUSDT" else "Binance XAUUSDT perpetual (0.05% taker)")
         lpreset = c2.selectbox("Charges", presets, index=presets.index(default), key=f"live_preset_{sym}")
         factors_on = ", ".join(FACTORS[k]["label"] for k in FACTORS if p_sel[f"inc_{k}"] and p_sel[f"w_{k}"] > 0) or "none"
         filters_on = ", ".join(n for n, on in (("RVOL spike", p_sel["use_rvol"]), ("volume dry-up", p_sel["use_vdu"]),
@@ -1001,6 +1212,11 @@ with tab_live:
         if d.button("Stop session"):
             live.stop_session()
             st.rerun()
+        to_mt5 = False
+        if mt5.is_mt5(sess["symbol"]):
+            to_mt5 = st.toggle("Draw signals on the MT5 chart", value=True, key="live_to_mt5", disabled=not mt5.STATE["connected"],
+                               help="Every refresh writes the session's entries, exits, stop and target for the GoldBotSignals "
+                                    "indicator on the chart. Needs MT5 connected and the indicator on the chart (MT5 tab).")
         stream = ticks.get_stream(sess["symbol"])
         stream.record = bool(rec)
 
@@ -1010,7 +1226,8 @@ with tab_live:
             stt = stream.status()
             if not stt["connected"]:
                 st.warning(f"Tick feed not connected ({stt['error'] or 'connecting...'}). The REST price is used instead. "
-                           f"Reconnect attempts: {stt['reconnects']}. Binance blocks US-hosted servers (HTTP 451).")
+                           f"Reconnect attempts: {stt['reconnects']}. " + ("Check MT5 is connected and the market is open."
+                                                                          if mt5.is_mt5(sess["symbol"]) else "Binance blocks US-hosted servers (HTTP 451)."))
                 return
             fb = stream.forming()
             c = st.columns(6)
@@ -1049,6 +1266,11 @@ with tab_live:
                 st.error(f"Live update failed: {type(e).__name__}: {e}")
                 return
             live.log_events(snap)
+            if to_mt5 and mt5.STATE["connected"]:
+                try:
+                    live.write_mt5_chart(snap)
+                except Exception as e:
+                    st.warning(f"Could not update the MT5 chart: {e}")
             pr, pos, f, closed = snap["price"], snap["position"], snap["feat"], snap["closed"]
             realised = closed["net_pnl"].sum() if not closed.empty else 0.0
             eq_live = sess["capital"] + realised + (pos["unrealised_pnl"] if pos is not None else 0.0)

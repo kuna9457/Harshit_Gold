@@ -1,63 +1,49 @@
 """Live paper trading on the Binance gold feed.
 
-A session is just: strategy settings + market + start time, saved in data/live/session.json.
+A session is just: strategy settings + market + start time, saved by store.py (data/live/session.json, or MongoDB).
 Every refresh pulls the newest closed bars, rebuilds the multi-horizon signal and runs the SAME backtest engine
 from the start time to now. The open position is the one the engine is still holding at the last bar.
 Nothing is sent to an exchange.
 """
 import json
-from datetime import datetime, timezone
 
 import pandas as pd
 
-from . import binance, mtf, ticks
+from . import binance, mt5, mtf, store, ticks
 from .config import DEFAULT_PARAMS, TIMEFRAMES
-from .data import ROOT
-
-LIVE = ROOT / "data" / "live"
-STRATS = ROOT / "data" / "strategies"
-LIVE.mkdir(parents=True, exist_ok=True)
-STRATS.mkdir(parents=True, exist_ok=True)
-SESSION = LIVE / "session.json"
-LOG = LIVE / "events.csv"
 
 
-# ---------- saved strategies ----------
+# ---------- saved strategies and the session (kept by store.py: files, or MongoDB when MONGODB_URI is set) ----------
 def save_strategy(name, params, note=""):
-    name = "".join(ch for ch in name if ch.isalnum() or ch in " -_").strip() or "strategy"
-    clean = {k: (v.item() if hasattr(v, "item") else v) for k, v in params.items() if k in DEFAULT_PARAMS}
-    (STRATS / f"{name}.json").write_text(json.dumps(dict(name=name, note=note, params=clean,
-                                                         saved=datetime.now(timezone.utc).isoformat(timespec="seconds")), indent=1))
-    return name
+    clean = {k: v for k, v in params.items() if k in DEFAULT_PARAMS}
+    return store.save_strategy(name, dict(note=note, params=clean))
 
 
 def list_strategies():
-    return sorted(p.stem for p in STRATS.glob("*.json"))
+    return store.list_strategies()
 
 
 def load_strategy(name):
-    d = json.loads((STRATS / f"{name}.json").read_text())
+    d = store.load_strategy(name)
     return {**DEFAULT_PARAMS, **{k: v for k, v in d["params"].items() if k in DEFAULT_PARAMS}}
 
 
-# ---------- session ----------
 def start_session(strategy_name, params, symbol, costs, capital):
     now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-    s = dict(strategy=strategy_name, symbol=symbol, params={k: (v.item() if hasattr(v, "item") else v) for k, v in params.items()},
-             costs=costs, capital=capital, started=now.isoformat(timespec="seconds"))
-    SESSION.write_text(json.dumps(s, indent=1))
-    return s
+    s = dict(strategy=strategy_name, symbol=symbol, params=params, costs=costs, capital=capital,
+             started=now.isoformat(timespec="seconds"))
+    store.set_session(s)
+    return store.get_session()
 
 
 def get_session():
-    return json.loads(SESSION.read_text()) if SESSION.exists() else None
+    return store.get_session()
 
 
 def stop_session():
-    s = get_session()
+    s = store.get_session()
     if s:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        SESSION.rename(LIVE / f"session_stopped_{stamp}.json")
+        store.archive_session()
     return s
 
 
@@ -73,12 +59,14 @@ def _closed(session, p, gold, raw, hmm, warmup_days):
     c = _BUILD.get("c")
     if c and c["key"] == key and now < c["until"]:
         return c
-    bars = binance.klines(symbol, update=True)
+    bars = mt5.klines(symbol, update=True) if mt5.is_mt5(symbol) else binance.klines(symbol, update=True)
     bars = bars[bars.index >= started - pd.Timedelta(days=warmup_days)]
     feat, base_tf = mtf.build(bars, gold, raw, p, hmm)
     # the next 15m bar to close finishes 30 minutes after the last closed bar opened; rebuild the moment it does.
     # (if Binance is a moment late with it, retry in 2 seconds; with_forming refuses to draw over the gap meanwhile)
     until = max(bars.index[-1] + pd.Timedelta(minutes=30), now + pd.Timedelta(seconds=2))
+    if now - bars.index[-1] > pd.Timedelta(hours=1):  # market closed (weekend / break): nothing new to build, do not redo it every 2 s
+        until = now + pd.Timedelta(seconds=60)
     _BUILD["c"] = c = dict(key=key, bars=bars, feat=feat, base_tf=base_tf, until=until)
     return c
 
@@ -130,7 +118,8 @@ def snapshot(session, gold, raw, hmm=None, warmup_days=400):
         out["price"] = dict(price=stream.mid, bid=stream.bid, ask=stream.ask, time=pd.Timestamp.now(tz="UTC").tz_localize(None), source="websocket")
     else:
         try:
-            out["price"] = {**binance.live_price(symbol), "source": "REST"}
+            out["price"] = {**(mt5.live_price(symbol) if mt5.is_mt5(symbol) else binance.live_price(symbol)),
+                            "source": "MT5 quote" if mt5.is_mt5(symbol) else "REST"}
         except Exception as e:
             out["price"] = dict(price=float(live_feat["Close"].iloc[-1]), bid=float("nan"), ask=float("nan"), time=None,
                                 error=str(e), source="last bar")
@@ -153,6 +142,23 @@ def snapshot(session, gold, raw, hmm=None, warmup_days=400):
     return out
 
 
+def write_mt5_chart(snap):
+    """Send the session's entries, exits, open-position stop and target to the MT5 chart indicator."""
+    sym = mt5.name_of(snap["symbol"])
+    res, pos, f = snap["res"], snap["position"], snap["feat"]
+    stop = target = None
+    if res is not None and pos is not None:
+        p_ = res["params"]
+        atr_prev = f["ATR"].loc[:pos["entry_date"]]
+        dist = p_["sl_atr_mult"] * (atr_prev.iloc[-2] if len(atr_prev) > 1 else atr_prev.iloc[-1])
+        sgn = 1 if pos["side"] == "Long" else -1
+        stop = pos["entry_price"] - sgn * dist if p_["use_sl"] else None
+        target = pos["entry_price"] + sgn * dist * p_["tp_rr"] if p_["use_tp"] else None
+    trades = res["trades"] if res is not None else pd.DataFrame()
+    rows = mt5.chart_rows(sym, trades, pos, stop, target)
+    return mt5.write_chart_file(sym, rows, title="live")
+
+
 def decision_text(feat, p):
     """What the bot will do at the next bar's open, from the last closed bar."""
     row = feat.iloc[-1]
@@ -167,11 +173,11 @@ def decision_text(feat, p):
 
 
 def log_events(snap):
-    """Append new trades (entries and exits) to data/live/events.csv; returns the rows added."""
+    """Record new trades (entries and exits) in the trade log; returns the rows added."""
     res = snap.get("res")
     if res is None or res["trades"].empty:
         return []
-    seen = set(pd.read_csv(LOG)["key"]) if LOG.exists() else set()
+    seen = store.event_keys()
     rows = []
     for _, t in res["trades"].iterrows():
         k_in = f"{snap['symbol']}|in|{t['entry_date']}"
@@ -183,5 +189,5 @@ def log_events(snap):
                 rows.append(dict(key=k_out, time=t["exit_date"], event=f"Close {t['side']} ({t['exit_reason']})",
                                  price=t["exit_price"], qty=t["qty"], pnl=t["net_pnl"]))
     if rows:
-        pd.DataFrame(rows).to_csv(LOG, mode="a", header=not LOG.exists(), index=False)
+        store.add_events(rows)
     return rows
